@@ -1,4 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { quantizePitchData, noteSequenceToString } from './utils/melodyQuantizer';
+import { matchMelody } from './utils/matchingEngine';
+import { songDatabase } from './utils/songDatabase';
 
 // ============================================
 // EARCANDY - Music Recognition & Recommendation
@@ -65,42 +68,66 @@ const sampleTracks = [
 // AUDIO ANALYSIS UTILITIES (Physics Layer)
 // ============================================
 
-// Attempt to detect fundamental pitch from audio data using autocorrelation
+// Attempt to detect fundamental pitch from audio data using FFT-based detection
 function detectPitch(audioData, sampleRate) {
-  // Autocorrelation-based pitch detection
+  // Simple FFT-like approach: find dominant frequency using power spectrum
   const bufferSize = audioData.length;
+  
+  // Find peak amplitude
+  let max = 0;
+  for (let i = 0; i < bufferSize; i++) {
+    max = Math.max(max, Math.abs(audioData[i]));
+  }
+  
+  if (max < 0.001) return null; // Too silent
+  
+  // Apply Hamming window to reduce spectral leakage
+  const windowed = new Float32Array(bufferSize);
+  for (let i = 0; i < bufferSize; i++) {
+    const window = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (bufferSize - 1));
+    windowed[i] = audioData[i] * window;
+  }
+  
+  // Simple energy-based pitch detection using autocorrelation
+  // but with better normalization
   const correlations = new Float32Array(bufferSize);
   
-  // Calculate autocorrelation
-  for (let lag = 0; lag < bufferSize; lag++) {
+  for (let lag = 1; lag < bufferSize; lag++) {
     let sum = 0;
+    let sum1 = 0;
+    let sum2 = 0;
+    
     for (let i = 0; i < bufferSize - lag; i++) {
-      sum += audioData[i] * audioData[i + lag];
+      sum += windowed[i] * windowed[i + lag];
+      sum1 += windowed[i] * windowed[i];
+      sum2 += windowed[i + lag] * windowed[i + lag];
     }
-    correlations[lag] = sum;
-  }
-  
-  // Find the first peak after the initial decline
-  let foundPeak = false;
-  let peakLag = 0;
-  let peakValue = 0;
-  
-  // Skip the first part (self-correlation peak)
-  const minLag = Math.floor(sampleRate / 1000); // Min frequency ~1000Hz
-  const maxLag = Math.floor(sampleRate / 60);   // Max frequency ~60Hz (human voice range)
-  
-  for (let lag = minLag; lag < maxLag && lag < bufferSize; lag++) {
-    if (correlations[lag] > peakValue) {
-      peakValue = correlations[lag];
-      peakLag = lag;
-      foundPeak = true;
+    
+    // Normalized cross-correlation
+    if (sum1 * sum2 > 0) {
+      correlations[lag] = sum / Math.sqrt(sum1 * sum2);
     }
   }
   
-  if (foundPeak && peakLag > 0) {
-    const frequency = sampleRate / peakLag;
-    // Sanity check: human voice typically 80-1000Hz
-    if (frequency >= 60 && frequency <= 1200) {
+  // Find the best period (lag with highest correlation after first dip)
+  let minLag = Math.floor(sampleRate / 400);  // Max freq ~400Hz
+  let maxLag = Math.floor(sampleRate / 60);   // Min freq ~60Hz
+  
+  let bestLag = 0;
+  let bestValue = -1;
+  
+  for (let lag = minLag; lag < Math.min(maxLag, bufferSize); lag++) {
+    if (correlations[lag] > bestValue) {
+      bestValue = correlations[lag];
+      bestLag = lag;
+    }
+  }
+  
+  // Only accept if correlation is strong enough
+  if (bestLag > 0 && bestValue > 0.5) {
+    const frequency = sampleRate / bestLag;
+    
+    if (frequency >= 60 && frequency <= 400) {
       return frequency;
     }
   }
@@ -146,8 +173,11 @@ export default function EarCandy() {
   const [recommendations, setRecommendations] = useState([]);
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [volumeLevel, setVolumeLevel] = useState(0);
-  const [activeTab, setActiveTab] = useState('record'); // record, mood, results
+  const [activeTab, setActiveTab] = useState('record'); // record, mood, results, recognition
   const [detectedFeatures, setDetectedFeatures] = useState(null);
+  const [quantizedNotes, setQuantizedNotes] = useState(null);
+  const [songMatches, setSongMatches] = useState([]);
+  const [isMatching, setIsMatching] = useState(false);
 
   // Refs for audio processing
   const mediaRecorderRef = useRef(null);
@@ -156,10 +186,13 @@ export default function EarCandy() {
   const streamRef = useRef(null);
   const animationRef = useRef(null);
   const chunksRef = useRef([]);
+  const pitchDataRef = useRef([]);
+  const isRecordingRef = useRef(false);
 
   // Start recording
   const startRecording = async () => {
     try {
+      console.log('Requesting microphone access...');
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: { 
           echoCancellation: true,
@@ -168,12 +201,15 @@ export default function EarCandy() {
         } 
       });
       
+      console.log('Microphone access granted, stream:', stream);
       streamRef.current = stream;
       
       // Set up audio context for real-time analysis
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = 2048;
+      
+      console.log('Audio context created, sample rate:', audioContextRef.current.sampleRate);
       
       const source = audioContextRef.current.createMediaStreamSource(stream);
       source.connect(analyserRef.current);
@@ -189,14 +225,22 @@ export default function EarCandy() {
       };
       
       mediaRecorderRef.current.onstop = () => {
+        console.log('MediaRecorder stopped');
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         setAudioBlob(blob);
-        analyzeRecording(blob);
+        // Use ref data for analysis to avoid state timing issues
+        // Small delay to ensure all pitch data is collected
+        setTimeout(() => {
+          analyzeRecording(blob, pitchDataRef.current);
+        }, 100);
       };
       
       mediaRecorderRef.current.start(100);
+      console.log('Recording started');
       setIsRecording(true);
+      isRecordingRef.current = true;
       setPitchData([]);
+      pitchDataRef.current = []; // Clear ref for new recording
       setAnalysisComplete(false);
       
       // Start real-time pitch detection
@@ -210,28 +254,56 @@ export default function EarCandy() {
 
   // Real-time pitch detection during recording
   const detectPitchRealtime = () => {
-    if (!analyserRef.current) return;
+    if (!analyserRef.current) {
+      console.error('Analyser not initialized');
+      return;
+    }
     
+    console.log('🎙️ Starting real-time pitch detection');
     const bufferLength = analyserRef.current.fftSize;
     const dataArray = new Float32Array(bufferLength);
+    let pitchCount = 0;
+    let lowSignalCount = 0;
     
     const detect = () => {
-      if (!isRecording && !animationRef.current) return;
+      // Continue detection while recording is active
+      if (!isRecordingRef.current) {
+        console.log(`🛑 Recording stopped. Pitch detections: ${pitchCount}, Low signal events: ${lowSignalCount}`);
+        return;
+      }
       
-      analyserRef.current.getFloatTimeDomainData(dataArray);
-      
-      const rms = calculateRMS(dataArray);
-      setVolumeLevel(Math.min(rms * 10, 1));
-      
-      // Only detect pitch if there's enough signal
-      if (rms > 0.01) {
+      try {
+        analyserRef.current.getFloatTimeDomainData(dataArray);
+        
+        const rms = calculateRMS(dataArray);
+        setVolumeLevel(Math.min(rms * 10, 1));
+        
+        // Log RMS periodically to debug signal levels
+        if (pitchDataRef.current.length % 30 === 0) {
+          console.log(`📊 RMS level: ${rms.toFixed(6)}, Pitch points so far: ${pitchDataRef.current.length}`);
+        }
+        
+        // Try to detect pitch regardless of volume - let the algorithm decide if it's valid
         const pitch = detectPitch(dataArray, audioContextRef.current.sampleRate);
         if (pitch) {
+          pitchCount++;
           setCurrentPitch(pitch);
           const note = frequencyToNote(pitch);
           setCurrentNote(note);
-          setPitchData(prev => [...prev.slice(-100), { time: Date.now(), pitch, note }]);
+          const newPitchData = { time: Date.now(), pitch, note };
+          pitchDataRef.current.push(newPitchData);
+          setPitchData(prev => [...prev.slice(-100), newPitchData]);
+          
+          if (pitchCount <= 5) {
+            console.log(`🎵 Pitch #${pitchCount}: ${pitch.toFixed(1)}Hz (${note.note}${note.octave}), RMS: ${rms.toFixed(6)}`);
+          }
+        } else {
+          if (pitchDataRef.current.length > 0 && pitchDataRef.current.length % 30 === 0) {
+            console.log(`  (no valid pitch detected in this frame, RMS: ${rms.toFixed(6)})`);
+          }
         }
+      } catch (e) {
+        console.error('Error in pitch detection:', e);
       }
       
       animationRef.current = requestAnimationFrame(detect);
@@ -243,6 +315,7 @@ export default function EarCandy() {
   // Stop recording
   const stopRecording = () => {
     setIsRecording(false);
+    isRecordingRef.current = false;
     
     if (animationRef.current) {
       cancelAnimationFrame(animationRef.current);
@@ -263,9 +336,14 @@ export default function EarCandy() {
   };
 
   // Analyze the complete recording
-  const analyzeRecording = async (blob) => {
+  const analyzeRecording = async (blob, collectedPitchData) => {
+    console.log('=== ANALYZE RECORDING START ===');
+    console.log('Pitch data points collected:', collectedPitchData.length);
+    console.log('First few pitch data points:', collectedPitchData.slice(0, 5));
+    
     // Extract features from recorded pitch data
-    if (pitchData.length === 0) {
+    if (collectedPitchData.length === 0) {
+      console.warn('⚠️ No pitch data collected during recording!');
       setDetectedFeatures({
         avgPitch: 0,
         pitchRange: 0,
@@ -273,10 +351,15 @@ export default function EarCandy() {
         estimatedTempo: 0,
         stability: 0
       });
+      setAnalysisComplete(true);
+      console.log('=== ANALYZE RECORDING END (NO DATA) ===');
       return;
     }
     
-    const pitches = pitchData.map(d => d.pitch).filter(p => p);
+    const pitches = collectedPitchData.map(d => d.pitch).filter(p => p);
+    console.log('Valid pitches extracted:', pitches.length);
+    console.log('Pitch values range:', Math.min(...pitches), '-', Math.max(...pitches));
+    
     const avgPitch = pitches.reduce((a, b) => a + b, 0) / pitches.length;
     const minPitch = Math.min(...pitches);
     const maxPitch = Math.max(...pitches);
@@ -284,7 +367,7 @@ export default function EarCandy() {
     
     // Find most common note
     const noteCounts = {};
-    pitchData.forEach(d => {
+    collectedPitchData.forEach(d => {
       if (d.note) {
         const key = d.note.note;
         noteCounts[key] = (noteCounts[key] || 0) + 1;
@@ -294,29 +377,67 @@ export default function EarCandy() {
     
     // Estimate tempo from pitch changes (simplified)
     let changes = 0;
-    for (let i = 1; i < pitchData.length; i++) {
-      if (Math.abs(pitchData[i].pitch - pitchData[i-1].pitch) > 20) {
+    for (let i = 1; i < collectedPitchData.length; i++) {
+      if (Math.abs(collectedPitchData[i].pitch - collectedPitchData[i-1].pitch) > 20) {
         changes++;
       }
     }
-    const durationSec = (pitchData[pitchData.length-1]?.time - pitchData[0]?.time) / 1000 || 1;
+    const durationSec = (collectedPitchData[collectedPitchData.length-1]?.time - collectedPitchData[0]?.time) / 1000 || 1;
     const estimatedTempo = Math.round((changes / durationSec) * 15); // Rough BPM estimate
     
     // Pitch stability (lower variance = more stable)
     const variance = pitches.reduce((sum, p) => sum + Math.pow(p - avgPitch, 2), 0) / pitches.length;
     const stability = Math.max(0, 100 - Math.sqrt(variance));
     
-    setDetectedFeatures({
+    const features = {
       avgPitch: Math.round(avgPitch),
       pitchRange: Math.round(pitchRange),
       dominantNote,
       estimatedTempo: Math.min(Math.max(estimatedTempo, 60), 200),
       stability: Math.round(stability)
-    });
+    };
+    
+    console.log('✅ Analysis complete:', features);
+    setDetectedFeatures(features);
+    
+    // Quantize pitch data into discrete notes
+    const notes = quantizePitchData(collectedPitchData, { windowMs: 150, minNoteDurationMs: 80 });
+    console.log('📝 Quantized notes:', notes.map(n => n.note + n.octave));
+    setQuantizedNotes(notes);
     
     setAnalysisComplete(true);
-    setActiveTab('mood');
+    console.log('=== ANALYZE RECORDING END (SUCCESS) ===');
   };
+
+  // Recognize songs from hummed melody
+  const recognizeSongs = useCallback(() => {
+    if (!quantizedNotes || quantizedNotes.length < 3) {
+      console.warn('⚠️ Need at least 3 notes for recognition');
+      alert('Please hum at least 3-4 notes for better recognition');
+      return;
+    }
+    
+    setIsMatching(true);
+    console.log('🔍 Starting song recognition...');
+    console.log('Quantized notes:', quantizedNotes.map(n => `${n.note}${n.octave}(${n.duration}ms)`).join(' '));
+    
+    // Convert quantized notes to string format
+    const noteStrings = quantizedNotes.map(n => n.note + n.octave);
+    console.log('Notes to match:', noteStrings);
+    
+    // Match against database with very lenient settings
+    const matches = matchMelody(noteStrings, songDatabase, {
+      maxResults: 5,
+      useTransposition: true,
+      useIntervals: true,
+      confidenceThreshold: 0.05  // Very lenient threshold
+    });
+    
+    console.log('🎵 Found matches:', matches);
+    setSongMatches(matches);
+    setActiveTab('recognition');
+    setIsMatching(false);
+  }, [quantizedNotes]);
 
   // Generate recommendations based on analysis and mood
   const generateRecommendations = useCallback(() => {
@@ -365,6 +486,7 @@ export default function EarCandy() {
   const reset = () => {
     setAudioBlob(null);
     setPitchData([]);
+    pitchDataRef.current = [];
     setCurrentPitch(null);
     setCurrentNote(null);
     setSelectedMood(null);
@@ -372,6 +494,8 @@ export default function EarCandy() {
     setAnalysisComplete(false);
     setVolumeLevel(0);
     setDetectedFeatures(null);
+    setQuantizedNotes(null);
+    setSongMatches([]);
     setActiveTab('record');
   };
 
@@ -509,17 +633,19 @@ export default function EarCandy() {
           display: 'flex',
           justifyContent: 'center',
           gap: '8px',
-          marginBottom: '30px'
+          marginBottom: '30px',
+          flexWrap: 'wrap'
         }}>
           {[
             { id: 'record', label: '1. Record', icon: '🎤' },
-            { id: 'mood', label: '2. Mood', icon: '💭' },
-            { id: 'results', label: '3. Discover', icon: '🌍' }
+            { id: 'recognition', label: '2. Recognize', icon: '🔍' },
+            { id: 'mood', label: '3. Mood', icon: '💭' },
+            { id: 'results', label: '4. Discover', icon: '🌍' }
           ].map((tab, i) => (
             <button
               key={tab.id}
               onClick={() => {
-                if (tab.id === 'record' || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) {
+                if (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) {
                   setActiveTab(tab.id);
                 }
               }}
@@ -533,8 +659,8 @@ export default function EarCandy() {
                 color: activeTab === tab.id ? colors.text : colors.textMuted,
                 fontSize: '0.9rem',
                 fontWeight: 500,
-                cursor: (tab.id === 'record' || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
-                opacity: (tab.id === 'record' || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
+                cursor: (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
+                opacity: (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
                 transition: 'all 0.3s ease',
                 fontFamily: 'inherit'
               }}
@@ -733,6 +859,191 @@ export default function EarCandy() {
                   <strong style={{ color: colors.secondary }}>Physics of Sound:</strong> We used Fourier analysis to decompose your audio into 
                   constituent frequencies, detected the fundamental pitch through autocorrelation, and mapped frequency patterns to 
                   musical notes using the equal temperament scale (A4 = 440 Hz).
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Recognition Tab */}
+        {activeTab === 'recognition' && (
+          <div style={{ animation: 'slideUp 0.5s ease' }}>
+            <div style={{
+              background: colors.cardBg,
+              borderRadius: '24px',
+              border: `1px solid ${colors.cardBorder}`,
+              padding: '40px',
+              textAlign: 'center'
+            }}>
+              <h3 style={{ margin: '0 0 10px 0', fontSize: '1.5rem' }}>
+                🔍 Recognize Your Melody
+              </h3>
+              <p style={{ color: colors.textMuted, marginBottom: '30px' }}>
+                We'll search our database for songs matching your hummed melody
+              </p>
+              
+              {quantizedNotes && (
+                <div style={{
+                  padding: '20px',
+                  background: 'rgba(78, 205, 196, 0.1)',
+                  borderRadius: '12px',
+                  marginBottom: '30px'
+                }}>
+                  <div style={{ color: colors.textMuted, fontSize: '0.85rem', marginBottom: '10px' }}>
+                    <strong>Your melody:</strong>
+                  </div>
+                  <div style={{
+                    fontFamily: "'Space Mono', monospace",
+                    color: colors.secondary,
+                    fontSize: '1.1rem',
+                    wordBreak: 'break-word'
+                  }}>
+                    {quantizedNotes.map((n, i) => (
+                      <span key={i} style={{ marginRight: '8px' }}>
+                        {n.note}{n.octave}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              <button
+                onClick={recognizeSongs}
+                disabled={!quantizedNotes || quantizedNotes.length === 0 || isMatching}
+                style={{
+                  padding: '15px 40px',
+                  borderRadius: '30px',
+                  border: 'none',
+                  background: quantizedNotes && quantizedNotes.length > 0
+                    ? `linear-gradient(135deg, ${colors.primary}, ${colors.purple})` 
+                    : colors.cardBg,
+                  color: quantizedNotes && quantizedNotes.length > 0 ? 'white' : colors.textMuted,
+                  fontSize: '1.1rem',
+                  fontWeight: 600,
+                  cursor: quantizedNotes && quantizedNotes.length > 0 ? 'pointer' : 'not-allowed',
+                  opacity: quantizedNotes && quantizedNotes.length > 0 ? 1 : 0.5,
+                  transition: 'all 0.3s ease',
+                  fontFamily: 'inherit'
+                }}
+              >
+                {isMatching ? '🔄 Searching...' : '🎵 Find Matches'}
+              </button>
+            </div>
+
+            {/* Matches Results */}
+            {songMatches && songMatches.length > 0 && (
+              <div style={{
+                background: colors.cardBg,
+                borderRadius: '24px',
+                border: `1px solid ${colors.cardBorder}`,
+                padding: '30px',
+                marginTop: '20px',
+                animation: 'slideUp 0.5s ease'
+              }}>
+                <h3 style={{ margin: '0 0 20px 0', fontSize: '1.3rem', textAlign: 'center' }}>
+                  🎵 Possible Matches
+                </h3>
+                
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {songMatches.map((match, i) => (
+                    <div
+                      key={match.songId}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        padding: '15px 20px',
+                        background: 'rgba(0,0,0,0.3)',
+                        borderRadius: '12px',
+                        gap: '15px',
+                        animation: 'slideUp 0.5s ease',
+                        animationDelay: `${i * 0.1}s`,
+                        animationFillMode: 'both'
+                      }}
+                    >
+                      {/* Confidence indicator */}
+                      <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        minWidth: '60px'
+                      }}>
+                        <div style={{
+                          width: '50px',
+                          height: '50px',
+                          borderRadius: '50%',
+                          background: match.confidence >= 70 ? colors.primary : match.confidence >= 40 ? colors.accent : colors.secondary,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: 'white',
+                          fontSize: '1.2rem',
+                          fontWeight: 700
+                        }}>
+                          {match.confidence}%
+                        </div>
+                      </div>
+                      
+                      {/* Song info */}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ 
+                          fontWeight: 600, 
+                          marginBottom: '4px',
+                          fontSize: '1.05rem'
+                        }}>
+                          {match.title}
+                        </div>
+                        <div style={{ 
+                          color: colors.textMuted, 
+                          fontSize: '0.85rem'
+                        }}>
+                          {match.artist}
+                        </div>
+                      </div>
+                      
+                      {/* Key info */}
+                      {match.transposition !== 0 && (
+                        <div style={{
+                          padding: '6px 12px',
+                          borderRadius: '20px',
+                          background: `${colors.purple}30`,
+                          color: colors.purple,
+                          fontSize: '0.75rem',
+                          fontWeight: 500,
+                          whiteSpace: 'nowrap'
+                        }}>
+                          Key: {match.originalKey} {match.transposition > 0 ? '+' : ''}{match.transposition}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                <p style={{
+                  marginTop: '20px',
+                  padding: '15px',
+                  background: 'rgba(255,107,107,0.1)',
+                  borderRadius: '12px',
+                  fontSize: '0.85rem',
+                  color: colors.textMuted,
+                  lineHeight: 1.6
+                }}>
+                  <strong style={{ color: colors.primary }}>How it works:</strong> We quantized your hummed melody into discrete notes, then compared it against a database using Dynamic Time Warping (DTW) to find the best matches. The algorithm is transposition-invariant, meaning it can recognize the same song even if you hum it in a different key.
+                </p>
+              </div>
+            )}
+
+            {songMatches && songMatches.length === 0 && !isMatching && (
+              <div style={{
+                background: colors.cardBg,
+                borderRadius: '24px',
+                border: `1px solid ${colors.cardBorder}`,
+                padding: '30px',
+                marginTop: '20px',
+                textAlign: 'center'
+              }}>
+                <p style={{ color: colors.textMuted }}>
+                  No matches found. Try humming a more popular song, or check the database!
                 </p>
               </div>
             )}
