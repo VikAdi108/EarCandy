@@ -1,0 +1,111 @@
+{
+  "generated": "2026-04-13T03:26:42.828Z",
+  "totalMidiFiles": 17256,
+  "totalExtracted": 17154,
+  "afterDedup": 10253,
+  "skipped": 102,
+  "uniqueArtists": 2197,
+  "avgMelodyQuality": 70.3,
+  "sampleEntries": [
+    {
+      "title": "Caught Up In You",
+      "artist": ".38 Special",
+      "notes": [
+        "G#4",
+        "F#4",
+        "G#4",
+        "E4",
+        "E4",
+        "D#4",
+        "E4",
+        "C#4",
+        "D#4",
+        "D#4",
+        "D#4",
+        "D#4"
+      ],
+      "key": "G#",
+      "quality": 82.5
+    },
+    {
+      "title": "Fantasy Girl",
+      "artist": ".38 Special",
+      "notes": [
+        "G#3",
+        "G#3",
+        "G#3",
+        "A3",
+        "A3",
+        "G#3",
+        "G#3",
+        "G#3",
+        "A3",
+        "A3",
+        "A3",
+        "B3"
+      ],
+      "key": "G#",
+      "quality": 37.5
+    },
+    {
+      "title": "A Campfire Song",
+      "artist": "10,000 Maniacs",
+      "notes": [
+        "F#4",
+        "F#4",
+        "G4",
+        "F#4",
+        "E4",
+        "F#4",
+        "E4",
+        "D4",
+        "D4",
+        "F#4",
+        "F#4",
+        "F#4"
+      ],
+      "key": "F#",
+      "quality": 80
+    },
+    {
+      "title": "Theme From The Godfather",
+      "artist": "101 Strings",
+      "notes": [
+        "G5",
+        "C6",
+        "D#6",
+        "D6",
+        "C6",
+        "D#6",
+        "C6",
+        "D6",
+        "C6",
+        "G#5",
+        "A#5",
+        "G5"
+      ],
+      "key": "G",
+      "quality": 55.60606060606061
+    },
+    {
+      "title": "Dreadlock Holiday",
+      "artist": "10cc",
+      "notes": [
+        "G4",
+        "A#4",
+        "D5",
+        "D5",
+        "C5",
+        "A4",
+        "F4",
+        "D#4",
+        "G4",
+        "A#4",
+        "A#4",
+        "F4"
+      ],
+      "key": "G",
+      "quality": 84.77272727272728
+    }
+  ]
+}
