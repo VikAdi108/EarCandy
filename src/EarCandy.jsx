@@ -110,8 +110,10 @@ function detectPitch(audioData, sampleRate) {
   }
   
   // Find the best period (lag with highest correlation after first dip)
+  // Range 80-400 Hz: rejects AC mains hum (60 Hz) and sub-bass noise,
+  // while still covering every realistic human humming voice (bass-baritone to soprano)
   let minLag = Math.floor(sampleRate / 400);  // Max freq ~400Hz
-  let maxLag = Math.floor(sampleRate / 60);   // Min freq ~60Hz
+  let maxLag = Math.floor(sampleRate / 80);   // Min freq ~80Hz
   
   let bestLag = 0;
   let bestValue = -1;
@@ -127,7 +129,7 @@ function detectPitch(audioData, sampleRate) {
   if (bestLag > 0 && bestValue > 0.5) {
     const frequency = sampleRate / bestLag;
     
-    if (frequency >= 60 && frequency <= 400) {
+    if (frequency >= 80 && frequency <= 400) {
       return frequency;
     }
   }

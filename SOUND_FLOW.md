@@ -135,7 +135,21 @@ Shifted by 3.8ms:  /\  /\  /\  /\     ← perfect match!
                                        Pitch = 1/0.0038 ≈ 263 Hz (C4)
 ```
 
-The detector is bounded to **60–400 Hz** — the human humming range. Anything outside that is rejected as noise.
+The detector is bounded to **80–400 Hz** — the realistic human humming range. Anything outside that is rejected as noise.
+
+### Why the floor is 80 Hz (not 60 Hz)
+
+The original 60 Hz floor was too generous. Two practical reasons we raised it:
+
+| Frequency | What lives there |
+|---|---|
+| **60 Hz** | US electrical mains hum — pure noise, never humming |
+| 65 Hz (C2) | Russian Octavist bass singers (extremely rare) |
+| **80 Hz** | Bottom of a bass-baritone's range — our new floor |
+| 82 Hz (E2) | Lowest string of a guitar |
+| 100 Hz | Bottom of typical male *humming* range |
+
+Cutting the 60-80 Hz band gets rid of AC mains hum (a real-world noise source) and shrinks the autocorrelation search by ~25%, while still catching every realistic human humming voice — bass-baritone to soprano.
 
 ---
 
