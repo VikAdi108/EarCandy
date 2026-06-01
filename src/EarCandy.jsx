@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { quantizePitchData, noteSequenceToString } from './utils/melodyQuantizer';
-import { matchMelody } from './utils/matchingEngine';
+import { matchMelody, MIN_DISTINCT_NOTES } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
+import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetection';
+import HowItWorks from './components/HowItWorks';
 
 // ============================================
 // EARCANDY - Music Recognition & Recommendation
@@ -64,101 +66,9 @@ const sampleTracks = [
   { id: 12, title: 'Hotel California', artist: 'Eagles', genre: 'american_rock', bpm: 75, key: 'Bm', mood: 'melancholic' },
 ];
 
-// ============================================
-// AUDIO ANALYSIS UTILITIES (Physics Layer)
-// ============================================
-
-// Attempt to detect fundamental pitch from audio data using FFT-based detection
-function detectPitch(audioData, sampleRate) {
-  // Simple FFT-like approach: find dominant frequency using power spectrum
-  const bufferSize = audioData.length;
-  
-  // Find peak amplitude
-  let max = 0;
-  for (let i = 0; i < bufferSize; i++) {
-    max = Math.max(max, Math.abs(audioData[i]));
-  }
-  
-  if (max < 0.001) return null; // Too silent
-  
-  // Apply Hamming window to reduce spectral leakage
-  const windowed = new Float32Array(bufferSize);
-  for (let i = 0; i < bufferSize; i++) {
-    const window = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (bufferSize - 1));
-    windowed[i] = audioData[i] * window;
-  }
-  
-  // Simple energy-based pitch detection using autocorrelation
-  // but with better normalization
-  const correlations = new Float32Array(bufferSize);
-  
-  for (let lag = 1; lag < bufferSize; lag++) {
-    let sum = 0;
-    let sum1 = 0;
-    let sum2 = 0;
-    
-    for (let i = 0; i < bufferSize - lag; i++) {
-      sum += windowed[i] * windowed[i + lag];
-      sum1 += windowed[i] * windowed[i];
-      sum2 += windowed[i + lag] * windowed[i + lag];
-    }
-    
-    // Normalized cross-correlation
-    if (sum1 * sum2 > 0) {
-      correlations[lag] = sum / Math.sqrt(sum1 * sum2);
-    }
-  }
-  
-  // Find the best period (lag with highest correlation after first dip)
-  // Range 80-400 Hz: rejects AC mains hum (60 Hz) and sub-bass noise,
-  // while still covering every realistic human humming voice (bass-baritone to soprano)
-  let minLag = Math.floor(sampleRate / 400);  // Max freq ~400Hz
-  let maxLag = Math.floor(sampleRate / 80);   // Min freq ~80Hz
-  
-  let bestLag = 0;
-  let bestValue = -1;
-  
-  for (let lag = minLag; lag < Math.min(maxLag, bufferSize); lag++) {
-    if (correlations[lag] > bestValue) {
-      bestValue = correlations[lag];
-      bestLag = lag;
-    }
-  }
-  
-  // Only accept if correlation is strong enough
-  if (bestLag > 0 && bestValue > 0.5) {
-    const frequency = sampleRate / bestLag;
-    
-    if (frequency >= 80 && frequency <= 400) {
-      return frequency;
-    }
-  }
-  
-  return null;
-}
-
-// Convert frequency to musical note
-function frequencyToNote(frequency) {
-  if (!frequency || frequency <= 0) return null;
-  
-  const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-  const A4 = 440;
-  const semitones = 12 * Math.log2(frequency / A4);
-  const semitonesFromC0 = Math.round(semitones) + 57; // A4 is 57 semitones above C0
-  const octave = Math.floor(semitonesFromC0 / 12);
-  const noteName = noteNames[((semitonesFromC0 % 12) + 12) % 12];
-  
-  return { note: noteName, octave, frequency: Math.round(frequency) };
-}
-
-// Calculate RMS amplitude (volume level)
-function calculateRMS(audioData) {
-  let sum = 0;
-  for (let i = 0; i < audioData.length; i++) {
-    sum += audioData[i] * audioData[i];
-  }
-  return Math.sqrt(sum / audioData.length);
-}
+// Audio analysis utilities (the "physics layer" — autocorrelation pitch detection,
+// frequency->note conversion, RMS loudness) live in ./utils/pitchDetection and are
+// shared with the "How it works" visualizer so both show the same data.
 
 // ============================================
 // MAIN COMPONENT
@@ -174,7 +84,6 @@ export default function EarCandy() {
   const [selectedMood, setSelectedMood] = useState(null);
   const [recommendations, setRecommendations] = useState([]);
   const [analysisComplete, setAnalysisComplete] = useState(false);
-  const [volumeLevel, setVolumeLevel] = useState(0);
   const [activeTab, setActiveTab] = useState('record'); // record, mood, results, recognition
   const [detectedFeatures, setDetectedFeatures] = useState(null);
   const [quantizedNotes, setQuantizedNotes] = useState(null);
@@ -190,6 +99,7 @@ export default function EarCandy() {
   const chunksRef = useRef([]);
   const pitchDataRef = useRef([]);
   const isRecordingRef = useRef(false);
+  const liveWaveCanvasRef = useRef(null);
 
   // Start recording
   const startRecording = async () => {
@@ -276,9 +186,28 @@ export default function EarCandy() {
       
       try {
         analyserRef.current.getFloatTimeDomainData(dataArray);
-        
+
         const rms = calculateRMS(dataArray);
-        setVolumeLevel(Math.min(rms * 10, 1));
+
+        // Draw the real waveform (the actual signal, not a decorative animation)
+        const waveCanvas = liveWaveCanvasRef.current;
+        if (waveCanvas) {
+          const ctx = waveCanvas.getContext('2d');
+          const w = waveCanvas.width;
+          const h = waveCanvas.height;
+          const mid = h / 2;
+          ctx.clearRect(0, 0, w, h);
+          ctx.strokeStyle = colors.primary;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let i = 0; i < dataArray.length; i++) {
+            const x = (i / (dataArray.length - 1)) * w;
+            const y = mid - dataArray[i] * mid * 0.92;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
         
         // Log RMS periodically to debug signal levels
         if (pitchDataRef.current.length % 30 === 0) {
@@ -413,9 +342,14 @@ export default function EarCandy() {
 
   // Recognize songs from hummed melody
   const recognizeSongs = useCallback(() => {
-    if (!quantizedNotes || quantizedNotes.length < 3) {
-      console.warn('⚠️ Need at least 3 notes for recognition');
-      alert('Please hum at least 3-4 notes for better recognition');
+    // Gate on DISTINCT notes — repeated same-pitch notes add no melodic information,
+    // and short hums match too many songs to identify reliably.
+    const distinctNotes = (quantizedNotes || []).filter(
+      (n, i, arr) => i === 0 || `${n.note}${n.octave}` !== `${arr[i - 1].note}${arr[i - 1].octave}`
+    ).length;
+    if (distinctNotes < MIN_DISTINCT_NOTES) {
+      console.warn(`⚠️ Need at least ${MIN_DISTINCT_NOTES} distinct notes (got ${distinctNotes})`);
+      alert(`Please hum a longer phrase — at least ${MIN_DISTINCT_NOTES} distinct notes. Short hums match too many songs to identify reliably.`);
       return;
     }
     
@@ -484,7 +418,6 @@ export default function EarCandy() {
     setSelectedMood(null);
     setRecommendations([]);
     setAnalysisComplete(false);
-    setVolumeLevel(0);
     setDetectedFeatures(null);
     setQuantizedNotes(null);
     setSongMatches([]);
@@ -632,12 +565,13 @@ export default function EarCandy() {
             { id: 'record', label: '1. Record', icon: '🎤' },
             { id: 'recognition', label: '2. Recognize', icon: '🔍' },
             { id: 'mood', label: '3. Mood', icon: '💭' },
-            { id: 'results', label: '4. Discover', icon: '🌍' }
+            { id: 'results', label: '4. Discover', icon: '🌍' },
+            { id: 'howitworks', label: 'How it works', icon: '🔬' }
           ].map((tab, i) => (
             <button
               key={tab.id}
               onClick={() => {
-                if (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || tab.id === 'mood' || (tab.id === 'results' && recommendations.length > 0)) {
+                if (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || tab.id === 'mood' || (tab.id === 'results' && recommendations.length > 0) || tab.id === 'howitworks') {
                   setActiveTab(tab.id);
                 }
               }}
@@ -651,8 +585,8 @@ export default function EarCandy() {
                 color: activeTab === tab.id ? colors.text : colors.textMuted,
                 fontSize: '0.9rem',
                 fontWeight: 500,
-                cursor: (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
-                opacity: (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
+                cursor: (tab.id === 'record' || tab.id === 'howitworks' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
+                opacity: (tab.id === 'record' || tab.id === 'howitworks' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
                 transition: 'all 0.3s ease',
                 fontFamily: 'inherit'
               }}
@@ -690,20 +624,13 @@ export default function EarCandy() {
               }}>
                 {isRecording ? (
                   <>
-                    {/* Live waveform visualization */}
-                    {[...Array(40)].map((_, i) => (
-                      <div
-                        key={i}
-                        style={{
-                          width: '6px',
-                          height: `${20 + Math.random() * volumeLevel * 150}px`,
-                          background: `linear-gradient(to top, ${colors.primary}, ${colors.accent})`,
-                          borderRadius: '3px',
-                          animation: `waveform ${0.3 + Math.random() * 0.3}s ease-in-out infinite`,
-                          animationDelay: `${i * 0.02}s`
-                        }}
-                      />
-                    ))}
+                    {/* Live waveform — the real time-domain signal from the mic */}
+                    <canvas
+                      ref={liveWaveCanvasRef}
+                      width={600}
+                      height={160}
+                      style={{ width: '100%', height: '100%' }}
+                    />
                     {/* Current note display */}
                     {currentNote && (
                       <div style={{
@@ -855,6 +782,11 @@ export default function EarCandy() {
               </div>
             )}
           </div>
+        )}
+
+        {/* How It Works Tab */}
+        {activeTab === 'howitworks' && (
+          <HowItWorks colors={colors} />
         )}
 
         {/* Recognition Tab */}
@@ -1156,8 +1088,7 @@ export default function EarCandy() {
                 marginBottom: '25px',
                 fontSize: '0.9rem'
               }}>
-                Based on your melody ({detectedFeatures?.dominantNote} @ ~{detectedFeatures?.estimatedTempo} BPM) 
-                and {moods.find(m => m.id === selectedMood)?.label.toLowerCase()} mood
+                Matched to your {moods.find(m => m.id === selectedMood)?.label.toLowerCase()} mood
               </p>
               
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
@@ -1266,9 +1197,9 @@ export default function EarCandy() {
                   background: 'rgba(255,107,107,0.1)', 
                   borderRadius: '12px' 
                 }}>
-                  <strong style={{ color: colors.primary }}>Physics Match:</strong><br/>
-                  Tracks selected based on tempo similarity (~{detectedFeatures?.estimatedTempo} BPM) 
-                  and compatible key signatures with your {detectedFeatures?.dominantNote} melody.
+                  <strong style={{ color: colors.primary }}>How these are picked:</strong><br/>
+                  Tracks are selected to match the mood you chose. Your melody's detected
+                  features (shown on the Record tab) aren't used for these picks yet.
                 </div>
                 <div style={{ 
                   padding: '15px', 

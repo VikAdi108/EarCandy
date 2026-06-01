@@ -20,6 +20,15 @@ function frequencyToSemitone(frequency) {
 }
 
 /**
+ * Convert frequency to a fractional semitone number (no rounding).
+ * Used for sub-semitone (cents) comparisons: 1 semitone = 100 cents.
+ */
+function frequencyToSemitoneExact(frequency) {
+  if (!frequency || frequency <= 0) return null;
+  return 12 * Math.log2(frequency / A4_FREQ) + A4_SEMITONE;
+}
+
+/**
  * Convert semitone number to note name and octave
  * Example: 60 -> { note: 'C', octave: 4, semitone: 60 }
  */
@@ -49,58 +58,63 @@ function frequencyToNote(frequency) {
  * @returns {Array} Array of { note, octave, duration, semitone } objects
  */
 function quantizePitchData(pitchData, options = {}) {
-  const { windowMs = 150, minNoteDurationMs = 80 } = options;
-  
+  // toleranceSemitones: how far a reading may drift from the current note's CENTER and
+  // still count as the same note. 0.5 semitone = ±50 cents, the note-rounding boundary:
+  // beyond half a semitone the reading is closer to a neighbouring note, so it starts a
+  // new one. Anchoring on the note center (not the first reading) makes the ±50¢ band
+  // symmetric around the note, matching how it's drawn in the "How it works" view.
+  const { windowMs = 150, minNoteDurationMs = 80, toleranceSemitones = 0.5 } = options;
+
   if (!pitchData || pitchData.length === 0) return [];
-  
+
   const notes = [];
-  let currentNoteSemitone = null;
+  let currentNoteCenter = null; // integer semitone of the current note's center, or null
   let noteStartTime = pitchData[0].time;
   let noteFrequencies = [];
-  
+
   for (let i = 0; i < pitchData.length; i++) {
     const { pitch, time } = pitchData[i];
     if (!pitch) continue;
-    
-    const semitone = frequencyToSemitone(pitch);
+
+    const semitoneExact = frequencyToSemitoneExact(pitch);
     const timeSinceStart = time - noteStartTime;
-    
+
     // Check if this pitch belongs to the same note or a new note
-    if (currentNoteSemitone === null) {
+    if (currentNoteCenter === null) {
       // First note
-      currentNoteSemitone = semitone;
+      currentNoteCenter = Math.round(semitoneExact);
       noteFrequencies = [pitch];
-    } else if (Math.abs(semitone - currentNoteSemitone) <= 2) {
-      // Same note (within 2 semitones tolerance - more lenient)
+    } else if (Math.abs(semitoneExact - currentNoteCenter) <= toleranceSemitones) {
+      // Same note: within ±50 cents of the note's center (the rounding boundary)
       noteFrequencies.push(pitch);
     } else if (timeSinceStart >= windowMs) {
       // Time to finalize the current note
       const avgFrequency = noteFrequencies.reduce((a, b) => a + b, 0) / noteFrequencies.length;
       const finalSemitone = frequencyToSemitone(avgFrequency);
       const noteInfo = semitoneToNote(finalSemitone);
-      
+
       notes.push({
         ...noteInfo,
         duration: timeSinceStart,
         frequency: avgFrequency
       });
-      
+
       console.log(`  Note: ${noteInfo.note}${noteInfo.octave} (${timeSinceStart}ms, avg freq: ${avgFrequency.toFixed(1)}Hz)`);
-      
+
       // Start new note
-      currentNoteSemitone = semitone;
+      currentNoteCenter = Math.round(semitoneExact);
       noteFrequencies = [pitch];
       noteStartTime = time;
     } else {
       // Pitch changed within window - favor the new pitch if it's sustained
-      currentNoteSemitone = semitone;
+      currentNoteCenter = Math.round(semitoneExact);
       noteFrequencies = [pitch];
       noteStartTime = time;
     }
   }
-  
+
   // Add the last note
-  if (currentNoteSemitone !== null && noteFrequencies.length > 0) {
+  if (currentNoteCenter !== null && noteFrequencies.length > 0) {
     const avgFrequency = noteFrequencies.reduce((a, b) => a + b, 0) / noteFrequencies.length;
     const finalSemitone = frequencyToSemitone(avgFrequency);
     const noteInfo = semitoneToNote(finalSemitone);
