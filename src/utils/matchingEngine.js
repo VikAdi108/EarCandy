@@ -179,11 +179,22 @@ function matchMelody(hummingNotes, songDatabase, options = {}) {
       if (hummingIntervals.length >= 2 && songIntervals.length >= 2) {
         // Try substring matching - user might hum only part of the song
         const distance = findBestSubstringMatch(hummingIntervals, songIntervals);
-        const maxLen = Math.max(hummingIntervals.length, songIntervals.length);
-        
-        // Convert distance to score (0-1, where 1 is perfect match)
-        // Each interval difference counts as some error
-        const normalizedDistance = distance / (maxLen * 2); // Max error per interval is ~2
+
+        // ─── NOTE (2026-05-30): Score-spread fix ──────────────────────────
+        // OLD: const normalizedDistance = distance / (Math.max(humming, song) * 2);
+        // The old denominator used the LONGER sequence × 2, which was 4-5×
+        // larger than the actual maximum possible distance. This compressed
+        // every match — even terrible ones — into the ~75-85% range.
+        //
+        // FIX: Since findBestSubstringMatch compares a window the size of the
+        // humming, the max possible Levenshtein distance equals the humming
+        // length. Dividing by that gives the true normalized error (0=perfect,
+        // 1=worst-case), restoring the full 0-100% spread between matches.
+        //
+        // Revisit if: scores feel too harsh, or we want to weight by song
+        // length again (e.g. to prefer matching against shorter melodies).
+        // ──────────────────────────────────────────────────────────────────
+        const normalizedDistance = distance / hummingIntervals.length;
         intervalScore = Math.max(0, 1 - normalizedDistance);
       }
       
