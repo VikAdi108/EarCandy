@@ -229,7 +229,7 @@ Human hearing is logarithmic — the formula respects how we actually perceive p
                       │
                       ▼
        ╔══════════════════════════════════════╗
-       ║  For each of 9,213 songs in DB:      ║
+       ║  For each of 8,468 songs in DB:      ║
        ║                                       ║
        ║   ┌─────────────────────────────┐    ║
        ║   │ findBestSubstringMatch()    │    ║  Line 70
@@ -323,7 +323,7 @@ Human hearing is logarithmic — the formula respects how we actually perceive p
 | [src/EarCandy.jsx](src/EarCandy.jsx) | Main React component, UI, audio I/O | `startRecording`, `detectPitch`, `detectPitchRealtime`, `analyzeRecording`, `recognizeSongs` |
 | [src/utils/melodyQuantizer.js](src/utils/melodyQuantizer.js) | Hz → discrete notes | `frequencyToSemitone`, `semitoneToNote`, `quantizePitchData` |
 | [src/utils/matchingEngine.js](src/utils/matchingEngine.js) | Note sequence → song match | `matchMelody`, `levenshteinDistance`, `dynamicTimeWarpingDistance`, `findBestSubstringMatch` |
-| [src/utils/songDatabase.js](src/utils/songDatabase.js) | 9,213 song melodies | `songDatabase` (array export) |
+| [src/utils/songDatabase.js](src/utils/songDatabase.js) | 8,468 song melodies | `songDatabase` (array export) |
 | [scripts/extractMelodies.js](scripts/extractMelodies.js) | MIDI → database pipeline | `processMidiFile`, `scoreMelodyTrack`, `extractOpeningNotes` |
 | [scripts/mergeDatabases.js](scripts/mergeDatabases.js) | Combine handcrafted + MIDI | priority merge |
 
@@ -362,4 +362,4 @@ A useful mental model for what's happening at each stage:
 
 ## The One-Sentence Summary
 
-> A sound wave becomes a song match by being **captured** (microphone → `AudioContext`), **measured** (autocorrelation finds the pitch), **named** (log₂ formula maps Hz to notes), **patterned** (consecutive notes become key-independent intervals), and **matched** (DTW + Levenshtein finds the closest melody in a 9,213-song database).
+> A sound wave becomes a song match by being **captured** (microphone → `AudioContext`), **measured** (autocorrelation finds the pitch), **named** (log₂ formula maps Hz to notes), **patterned** (consecutive notes become key-independent intervals), and **matched** (DTW + Levenshtein finds the closest melody in an 8,468-song database).

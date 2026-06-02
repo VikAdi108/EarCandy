@@ -468,7 +468,7 @@ This is why singing in any key works. The matching engine compares interval patt
 **File: [src/utils/matchingEngine.js:162-203](src/utils/matchingEngine.js#L162-L203)** — main loop inside `matchMelody()`
 
 ```javascript
-for (const song of songDatabase) {              // 9,213 iterations
+for (const song of songDatabase) {              // 8,468 iterations
   const songSemitones = notesToSemitones(song.notes);
   const songIntervals = getIntervals(songSemitones);
 
@@ -582,7 +582,7 @@ Slides your humming along every possible position in the song's full melody. Let
    Step 12│ 🟦  getIntervals()
           │     ──> [+4, +3, +5]
           │
-   Step 13│ 🟦  matchMelody() — DTW + Levenshtein × 9,213 songs
+   Step 13│ 🟦  matchMelody() — DTW + Levenshtein × 8,468 songs
           │     ──> [{title, confidence, artist}, ...]
           │
    Step 14│ 🟦  React renders confidence cards

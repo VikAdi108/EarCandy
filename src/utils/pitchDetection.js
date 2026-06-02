@@ -20,8 +20,18 @@ const A4_FREQ = 440;
 export const MIN_FREQ = 80;
 export const MAX_FREQ = 400;
 
-const MIN_CORRELATION = 0.5;   // reject weak / ambiguous matches
-const SILENCE_THRESHOLD = 0.001;
+// Reject frames that aren't clearly pitched. Real hummed notes score 0.79–0.97 here
+// (low notes ~0.79 since fewer periods fit the window; amplitude-independent, so quiet
+// hums still pass); breath and room noise sit at ~0.07–0.09. 0.6 clears noise with
+// margin without clipping legitimate low/quiet notes.
+const MIN_CORRELATION = 0.6;
+const SILENCE_THRESHOLD = 0.005;
+
+// Octave-error correction: the global correlation max is often a SUB-HARMONIC (an
+// octave/fifth too low, because correlation is high at integer multiples of the true
+// period). Instead, accept the shortest-lag peak whose correlation is at least this
+// fraction of the max — that shortest strong period is the true fundamental.
+const OCTAVE_PREFERENCE = 0.8;
 
 /**
  * Analyze one frame of time-domain audio with normalized autocorrelation.
@@ -91,13 +101,38 @@ export function analyzePitchFrame(audioData, sampleRate) {
     }
   }
 
-  // Pick the lag with the strongest self-match within the human-humming range.
+  // Find the strongest self-match in the human-humming range.
+  const searchMax = Math.min(maxLag, bufferSize - 1);
+  let maxVal = -1;
+  for (let lag = minLag; lag <= searchMax; lag++) {
+    if (correlations[lag] > maxVal) maxVal = correlations[lag];
+  }
+
+  // Octave-error correction: rather than take the global max (often a sub-harmonic an
+  // octave too low), take the SHORTEST-lag local peak that is nearly as strong — the
+  // fundamental. correlation peaks recur at multiples of the true period, so the first
+  // strong peak (shortest period / highest frequency) is the one we want.
+  const peakThreshold = OCTAVE_PREFERENCE * maxVal;
   let bestLag = 0;
   let bestValue = -1;
-  for (let lag = minLag; lag < Math.min(maxLag, bufferSize); lag++) {
-    if (correlations[lag] > bestValue) {
-      bestValue = correlations[lag];
+  for (let lag = minLag + 1; lag < searchMax; lag++) {
+    if (
+      correlations[lag] >= peakThreshold &&
+      correlations[lag] >= correlations[lag - 1] &&
+      correlations[lag] >= correlations[lag + 1]
+    ) {
       bestLag = lag;
+      bestValue = correlations[lag];
+      break; // shortest qualifying period = fundamental
+    }
+  }
+  // Fallback (e.g. monotonic correlation, no clear local peak): use the global max lag.
+  if (bestLag === 0) {
+    for (let lag = minLag; lag <= searchMax; lag++) {
+      if (correlations[lag] > bestValue) {
+        bestValue = correlations[lag];
+        bestLag = lag;
+      }
     }
   }
   result.bestLag = bestLag;
