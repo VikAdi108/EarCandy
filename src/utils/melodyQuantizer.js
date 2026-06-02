@@ -20,6 +20,15 @@ function frequencyToSemitone(frequency) {
 }
 
 /**
+ * Convert frequency to a fractional semitone number (no rounding).
+ * Used for sub-semitone (cents) comparisons: 1 semitone = 100 cents.
+ */
+function frequencyToSemitoneExact(frequency) {
+  if (!frequency || frequency <= 0) return null;
+  return 12 * Math.log2(frequency / A4_FREQ) + A4_SEMITONE;
+}
+
+/**
  * Convert semitone number to note name and octave
  * Example: 60 -> { note: 'C', octave: 4, semitone: 60 }
  */
@@ -40,82 +49,125 @@ function frequencyToNote(frequency) {
 }
 
 /**
- * Quantize pitch data (array of { pitch, time } objects) to a note sequence
- * Groups nearby pitches together and returns discrete notes
- * 
+ * Median-smooth the pitch stream to suppress vibrato and frame-to-frame jitter
+ * before segmentation. Each reading's pitch becomes the median of the valid pitches
+ * in a window centred on it. Median (not mean) so the occasional outlier frame
+ * (e.g. a momentary octave glitch) can't drag the value.
+ */
+function medianSmoothPitches(pitchData, windowSize) {
+  const half = Math.floor(windowSize / 2);
+  return pitchData.map((d, i) => {
+    const vals = [];
+    for (let j = Math.max(0, i - half); j <= Math.min(pitchData.length - 1, i + half); j++) {
+      if (pitchData[j].pitch) vals.push(pitchData[j].pitch);
+    }
+    if (vals.length === 0) return { ...d };
+    vals.sort((a, b) => a - b);
+    return { ...d, pitch: vals[Math.floor(vals.length / 2)] };
+  });
+}
+
+/**
+ * Quantize pitch data (array of { pitch, time } objects) to a note sequence.
+ *
+ * Two-stage, robust to the wobble of real (untrained) humming:
+ *   1. median-smooth the pitch stream (kills vibrato/jitter), then
+ *   2. group consecutive readings by nearest note (±50¢ band), but require a
+ *      deviation to PERSIST for `confirmFrames` frames before starting a new note,
+ *      so a transient excursion (vibrato peak, glitch) doesn't shatter a held note.
+ *
  * @param {Array} pitchData - Array of { pitch, time } objects
- * @param {number} options.windowMs - Time window to group notes (default: 150ms)
- * @param {number} options.minNoteDurationMs - Minimum note duration (default: 80ms)
- * @returns {Array} Array of { note, octave, duration, semitone } objects
+ * @param {number} options.minNoteDurationMs - drop notes shorter than this (default 80)
+ * @param {number} options.toleranceSemitones - ±band around a note's center (default 0.5 = ±50¢)
+ * @param {number} options.smoothWindow - median-filter width in frames (default 15 ≈ 240ms
+ *        at 60fps; ~one vibrato period, enough to flatten ±120¢ wobble into one note.
+ *        Trade-off: very fast humming with notes shorter than ~240ms may merge.)
+ * @param {number} options.confirmFrames - consecutive out-of-band frames to confirm a new note (default 4)
+ * @returns {Array} Array of { note, octave, duration, frequency, semitone } objects
  */
 function quantizePitchData(pitchData, options = {}) {
-  const { windowMs = 150, minNoteDurationMs = 80 } = options;
-  
+  const {
+    minNoteDurationMs = 80,
+    toleranceSemitones = 0.5,
+    smoothWindow = 15,
+    confirmFrames = 4,
+  } = options;
+
   if (!pitchData || pitchData.length === 0) return [];
-  
+
+  const smoothed = medianSmoothPitches(pitchData, smoothWindow);
+
   const notes = [];
-  let currentNoteSemitone = null;
-  let noteStartTime = pitchData[0].time;
+  let currentNoteCenter = null; // integer semitone of the current note's center, or null
+  let noteStartTime = smoothed[0].time;
   let noteFrequencies = [];
-  
-  for (let i = 0; i < pitchData.length; i++) {
-    const { pitch, time } = pitchData[i];
-    if (!pitch) continue;
-    
-    const semitone = frequencyToSemitone(pitch);
-    const timeSinceStart = time - noteStartTime;
-    
-    // Check if this pitch belongs to the same note or a new note
-    if (currentNoteSemitone === null) {
-      // First note
-      currentNoteSemitone = semitone;
-      noteFrequencies = [pitch];
-    } else if (Math.abs(semitone - currentNoteSemitone) <= 2) {
-      // Same note (within 2 semitones tolerance - more lenient)
-      noteFrequencies.push(pitch);
-    } else if (timeSinceStart >= windowMs) {
-      // Time to finalize the current note
-      const avgFrequency = noteFrequencies.reduce((a, b) => a + b, 0) / noteFrequencies.length;
-      const finalSemitone = frequencyToSemitone(avgFrequency);
-      const noteInfo = semitoneToNote(finalSemitone);
-      
-      notes.push({
-        ...noteInfo,
-        duration: timeSinceStart,
-        frequency: avgFrequency
-      });
-      
-      console.log(`  Note: ${noteInfo.note}${noteInfo.octave} (${timeSinceStart}ms, avg freq: ${avgFrequency.toFixed(1)}Hz)`);
-      
-      // Start new note
-      currentNoteSemitone = semitone;
-      noteFrequencies = [pitch];
-      noteStartTime = time;
-    } else {
-      // Pitch changed within window - favor the new pitch if it's sustained
-      currentNoteSemitone = semitone;
-      noteFrequencies = [pitch];
-      noteStartTime = time;
-    }
-  }
-  
-  // Add the last note
-  if (currentNoteSemitone !== null && noteFrequencies.length > 0) {
+  // pending candidate for a new note, used to absorb transient excursions
+  let candidateCenter = null;
+  let candidateCount = 0;
+  let candidateStartTime = 0;
+  let candidateFreqs = [];
+
+  const finalize = (endTime) => {
+    if (currentNoteCenter === null || noteFrequencies.length === 0) return;
     const avgFrequency = noteFrequencies.reduce((a, b) => a + b, 0) / noteFrequencies.length;
-    const finalSemitone = frequencyToSemitone(avgFrequency);
-    const noteInfo = semitoneToNote(finalSemitone);
-    const duration = pitchData[pitchData.length - 1].time - noteStartTime;
-    
-    notes.push({
-      ...noteInfo,
-      duration,
-      frequency: avgFrequency
-    });
-    
-    console.log(`  Note: ${noteInfo.note}${noteInfo.octave} (${duration}ms, avg freq: ${avgFrequency.toFixed(1)}Hz)`);
+    const noteInfo = semitoneToNote(frequencyToSemitone(avgFrequency));
+    notes.push({ ...noteInfo, duration: endTime - noteStartTime, frequency: avgFrequency });
+    console.log(`  Note: ${noteInfo.note}${noteInfo.octave} (${endTime - noteStartTime}ms, avg freq: ${avgFrequency.toFixed(1)}Hz)`);
+  };
+
+  for (let i = 0; i < smoothed.length; i++) {
+    const { pitch, time } = smoothed[i];
+    if (!pitch) continue;
+
+    const semitoneExact = frequencyToSemitoneExact(pitch);
+    const noteCenter = Math.round(semitoneExact);
+
+    if (currentNoteCenter === null) {
+      // First note
+      currentNoteCenter = noteCenter;
+      noteStartTime = time;
+      noteFrequencies = [pitch];
+      candidateCenter = null;
+      candidateCount = 0;
+      continue;
+    }
+
+    if (Math.abs(semitoneExact - currentNoteCenter) <= toleranceSemitones) {
+      // Still within the current note's ±50¢ band: a prior excursion was transient.
+      noteFrequencies.push(pitch);
+      candidateCenter = null;
+      candidateCount = 0;
+      continue;
+    }
+
+    // Out of band -> possible new note. Only commit once it persists.
+    if (noteCenter === candidateCenter) {
+      candidateCount++;
+      candidateFreqs.push(pitch);
+    } else {
+      candidateCenter = noteCenter;
+      candidateCount = 1;
+      candidateStartTime = time;
+      candidateFreqs = [pitch];
+    }
+
+    if (candidateCount >= confirmFrames) {
+      // Confirmed: close out the current note where the new pitch began, then start it.
+      finalize(candidateStartTime);
+      currentNoteCenter = candidateCenter;
+      noteStartTime = candidateStartTime;
+      noteFrequencies = candidateFreqs.slice();
+      candidateCenter = null;
+      candidateCount = 0;
+      candidateFreqs = [];
+    }
+    // else: transient excursion — ignore it, the current note continues.
   }
-  
-  // Filter out very short notes (likely artifacts)
+
+  // Close out the final note.
+  finalize(smoothed[smoothed.length - 1].time);
+
+  // Drop notes shorter than the minimum (likely artifacts).
   const filtered = notes.filter(n => n.duration >= minNoteDurationMs);
   console.log(`Quantized ${notes.length} notes, kept ${filtered.length} after filtering`);
   return filtered;
