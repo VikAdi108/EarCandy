@@ -3,6 +3,7 @@ import { quantizePitchData, noteSequenceToString } from './utils/melodyQuantizer
 import { matchMelody, MIN_DISTINCT_NOTES } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
 import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetection';
+import { recognizeWithAudD, shouldUseFallback, isSandboxToken } from './utils/auddFallback';
 import HowItWorks from './components/HowItWorks';
 
 // ============================================
@@ -89,6 +90,9 @@ export default function EarCandy() {
   const [quantizedNotes, setQuantizedNotes] = useState(null);
   const [songMatches, setSongMatches] = useState([]);
   const [isMatching, setIsMatching] = useState(false);
+  const [auddMatches, setAuddMatches] = useState([]);
+  const [isAuddSearching, setIsAuddSearching] = useState(false);
+  const [auddError, setAuddError] = useState(null);
 
   // Refs for audio processing
   const mediaRecorderRef = useRef(null);
@@ -341,7 +345,7 @@ export default function EarCandy() {
   };
 
   // Recognize songs from hummed melody
-  const recognizeSongs = useCallback(() => {
+  const recognizeSongs = useCallback(async () => {
     // Gate on DISTINCT notes — repeated same-pitch notes add no melodic information,
     // and short hums match too many songs to identify reliably.
     const distinctNotes = (quantizedNotes || []).filter(
@@ -352,26 +356,45 @@ export default function EarCandy() {
       alert(`Please hum a longer phrase — at least ${MIN_DISTINCT_NOTES} distinct notes. Short hums match too many songs to identify reliably.`);
       return;
     }
-    
+
     setIsMatching(true);
+    setAuddMatches([]);
+    setAuddError(null);
     console.log('🔍 Starting song recognition...');
     console.log('Quantized notes:', quantizedNotes.map(n => `${n.note}${n.octave}(${n.duration}ms)`).join(' '));
-    
+
     // Convert quantized notes to string format
     const noteStrings = quantizedNotes.map(n => n.note + n.octave);
     console.log('Notes to match:', noteStrings);
-    
-    // Match against database with very lenient settings
+
+    // Match against the active database (demo OR full — same code path either way).
     const matches = matchMelody(noteStrings, songDatabase, {
       maxResults: 5,
       useTransposition: true,
     });
-    
-    console.log('🎵 Found matches:', matches);
+
+    console.log('🎵 Local matches:', matches);
     setSongMatches(matches);
     setActiveTab('recognition');
     setIsMatching(false);
-  }, [quantizedNotes]);
+
+    // Cloud fallback: when local matcher is uncertain (low top score or no clear
+    // winner), send the recorded audio to AudD for a neural-fingerprint match
+    // against ~80M songs. Runs the same way regardless of which local DB is loaded.
+    if (audioBlob && shouldUseFallback(matches)) {
+      setIsAuddSearching(true);
+      try {
+        const auddResults = await recognizeWithAudD(audioBlob);
+        console.log('☁️  AudD matches:', auddResults);
+        setAuddMatches(auddResults);
+      } catch (err) {
+        console.warn('AudD fallback failed:', err);
+        setAuddError(err.message || 'Cloud search unavailable');
+      } finally {
+        setIsAuddSearching(false);
+      }
+    }
+  }, [quantizedNotes, audioBlob]);
 
   // Generate recommendations based on analysis and mood
   const generateRecommendations = useCallback(() => {
@@ -954,6 +977,109 @@ export default function EarCandy() {
                 }}>
                   <strong style={{ color: colors.primary }}>How it works:</strong> We quantized your hummed melody into discrete notes, then compared it against a database using Dynamic Time Warping (DTW) to find the best matches. The algorithm is transposition-invariant, meaning it can recognize the same song even if you hum it in a different key.
                 </p>
+              </div>
+            )}
+
+            {/* AudD Cloud Fallback Results */}
+            {(isAuddSearching || auddMatches.length > 0 || auddError) && (
+              <div style={{
+                background: colors.cardBg,
+                borderRadius: '24px',
+                border: `1px solid ${colors.cardBorder}`,
+                padding: '30px',
+                marginTop: '20px',
+                animation: 'slideUp 0.5s ease'
+              }}>
+                <h3 style={{ margin: '0 0 8px 0', fontSize: '1.3rem', textAlign: 'center' }}>
+                  ☁️ Cloud Backup Search (AudD)
+                </h3>
+                <p style={{
+                  margin: '0 0 20px 0',
+                  fontSize: '0.8rem',
+                  color: colors.textMuted,
+                  textAlign: 'center'
+                }}>
+                  Local match was uncertain — searched AudD's ~80M-song neural fingerprint database
+                  {isSandboxToken() && ' (sandbox token — limited)'}
+                </p>
+
+                {isAuddSearching && (
+                  <p style={{ textAlign: 'center', color: colors.textMuted }}>
+                    🔄 Searching cloud database...
+                  </p>
+                )}
+
+                {auddError && (
+                  <p style={{
+                    padding: '15px',
+                    background: 'rgba(255,107,107,0.1)',
+                    borderRadius: '12px',
+                    color: colors.textMuted,
+                    fontSize: '0.9rem'
+                  }}>
+                    ⚠️ {auddError}
+                    {isSandboxToken() && (
+                      <span> — set <code>VITE_AUDD_API_TOKEN</code> in <code>.env</code> for a real key.</span>
+                    )}
+                  </p>
+                )}
+
+                {auddMatches.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    {auddMatches.map((match, i) => (
+                      <div
+                        key={`audd-${i}`}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          padding: '15px 20px',
+                          background: 'rgba(0,0,0,0.3)',
+                          borderRadius: '12px',
+                          gap: '15px'
+                        }}
+                      >
+                        <div style={{
+                          width: '50px',
+                          height: '50px',
+                          borderRadius: '50%',
+                          background: colors.purple,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: 'white',
+                          fontSize: '1.0rem',
+                          fontWeight: 700
+                        }}>
+                          {match.confidence}%
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontWeight: 600, marginBottom: '4px', fontSize: '1.05rem' }}>
+                            {match.title}
+                          </div>
+                          <div style={{ color: colors.textMuted, fontSize: '0.85rem' }}>
+                            {match.artist}
+                          </div>
+                        </div>
+                        <div style={{
+                          padding: '6px 12px',
+                          borderRadius: '20px',
+                          background: `${colors.purple}30`,
+                          color: colors.purple,
+                          fontSize: '0.7rem',
+                          whiteSpace: 'nowrap'
+                        }}>
+                          ☁️ AudD
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!isAuddSearching && auddMatches.length === 0 && !auddError && (
+                  <p style={{ textAlign: 'center', color: colors.textMuted, fontSize: '0.9rem' }}>
+                    No cloud matches found either.
+                  </p>
+                )}
               </div>
             )}
 

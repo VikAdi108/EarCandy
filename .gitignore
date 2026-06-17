@@ -17,6 +17,7 @@ midi/
 src/utils/songDatabase_midi.js
 src/utils/songDatabase_handcrafted_backup.js
 src/utils/songDatabase_merged.js
+src/utils/songDatabase_merged_9213.js
 
 # Editor directories and files
 .vscode/*
@@ -28,3 +29,6 @@ src/utils/songDatabase_merged.js
 *.njsproj
 *.sln
 *.sw?
+
+# Local environment overrides (API tokens, etc)
+.env
