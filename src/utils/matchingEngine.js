@@ -13,9 +13,11 @@ const INTERVAL_ERROR_SCALE = 1.5;
 // = coverage matters more. 0.4 means a fragment match keeps at most 40% of its score.
 const COVERAGE_FLOOR = 0.4;
 
-// Minimum distinct notes required to attempt a confident match. Short hums share
-// interval patterns with too many songs to be identifiable (see findings).
-const MIN_DISTINCT_NOTES = 6;
+// Minimum distinct notes required to attempt a confident match.
+// Demo-mode (83-song handcrafted DB): lowered to 4 so short songs like Happy
+// Birthday (5 distinct notes) and Twinkle Twinkle short (3 distinct) can match.
+// In full-DB mode, raise back to 6 to reduce collisions across 8k+ songs.
+const MIN_DISTINCT_NOTES = 4;
 
 /**
  * Dynamic Time Warping Distance

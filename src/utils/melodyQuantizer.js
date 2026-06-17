@@ -87,7 +87,10 @@ function medianSmoothPitches(pitchData, windowSize) {
  */
 function quantizePitchData(pitchData, options = {}) {
   const {
-    minNoteDurationMs = 80,
+    // Raised from 80 to 180ms for demo-mode (small DB, casual humming):
+    // filters transitional notes and breath blips between phrases so the
+    // matcher sees a cleaner contour. Revisit if very fast humming gets cut.
+    minNoteDurationMs = 180,
     toleranceSemitones = 0.5,
     smoothWindow = 15,
     confirmFrames = 4,
