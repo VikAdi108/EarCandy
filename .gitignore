@@ -12,8 +12,11 @@ dist
 dist-ssr
 *.local
 
-# MIDI dataset (large, not needed at runtime)
+# Raw datasets used by scripts/ — large, regenerable at any time
 midi/
+data/
+
+# MIDI dataset (large, not needed at runtime)
 src/utils/songDatabase_midi.js
 src/utils/songDatabase_handcrafted_backup.js
 src/utils/songDatabase_merged.js

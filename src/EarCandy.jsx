@@ -4,7 +4,15 @@ import { matchMelody, getThresholdsForDB } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
 import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetection';
 import { recognizeWithAudD, shouldUseFallback, isSandboxToken } from './utils/auddFallback';
-import { tracksDatabase as sampleTracks } from './utils/tracksDatabase';
+import { tracksDatabase } from './utils/tracksDatabase';
+import { spotifyTracks } from './utils/spotifyTracks';
+
+// Stage 3b merge: curated 100-track baseline + Spotify-derived pool.
+// The curated tracks come first so their hand-tagged metadata (regional
+// categories like Carnatic, Qawwali) takes precedence in any ID-based lookups.
+// Both pools share the same schema; the scorer treats them identically.
+// Spotify-origin tracks carry source: 'spotify' for UI/debug purposes.
+const sampleTracks = [...tracksDatabase, ...spotifyTracks];
 import HowItWorks from './components/HowItWorks';
 
 // ============================================
@@ -63,20 +71,104 @@ function nearestNamedMood(valence, energy) {
   return { mood: best, distance: bestDist };
 }
 
-// Global genre database representing diverse musical traditions
+// Global genre database — display info (region label + color) per genre id.
+// Two-tier taxonomy per memory/earcandy_genre_taxonomy.md:
+//   Tier 1 (CURATED) — our 12 hand-picked regional categories. These are the
+//     identity of the global recommendation pitch; they appear first and never
+//     get collapsed onto Spotify equivalents.
+//   Tier 2 (SPOTIFY) — common Spotify genre labels we want to display nicely.
+//     Tracks with genres NOT in either tier still render via a default
+//     ("Global" region, primary color) so no track is ever hidden.
 const globalGenres = [
-  { id: 'carnatic', name: 'Carnatic Classical', region: 'South India', color: '#ff9f43' },
-  { id: 'hindustani', name: 'Hindustani Classical', region: 'North India', color: '#ee5a24' },
-  { id: 'finnish_metal', name: 'Finnish Death Metal', region: 'Finland', color: '#2d3436' },
-  { id: 'reggaeton', name: 'Reggaetón', region: 'Puerto Rico', color: '#00b894' },
-  { id: 'gospel', name: 'Gospel', region: 'USA', color: '#fdcb6e' },
-  { id: 'kpop', name: 'K-Pop', region: 'South Korea', color: '#fd79a8' },
-  { id: 'afrobeat', name: 'Afrobeat', region: 'West Africa', color: '#e17055' },
-  { id: 'bossa_nova', name: 'Bossa Nova', region: 'Brazil', color: '#74b9ff' },
-  { id: 'flamenco', name: 'Flamenco', region: 'Spain', color: '#d63031' },
-  { id: 'jpop', name: 'J-Pop', region: 'Japan', color: '#ff7675' },
-  { id: 'qawwali', name: 'Qawwali', region: 'Pakistan', color: '#a29bfe' },
-  { id: 'american_rock', name: 'American Rock', region: 'USA', color: '#636e72' },
+  // ── Tier 1: Curated regional categories ───────────────────────────────────
+  { id: 'carnatic',      name: 'Carnatic Classical',   region: 'South India',     color: '#ff9f43' },
+  { id: 'hindustani',    name: 'Hindustani Classical', region: 'North India',     color: '#ee5a24' },
+  { id: 'finnish_metal', name: 'Finnish Death Metal',  region: 'Finland',         color: '#2d3436' },
+  { id: 'reggaeton',     name: 'Reggaetón',            region: 'Puerto Rico',     color: '#00b894' },
+  { id: 'gospel',        name: 'Gospel',               region: 'USA',             color: '#fdcb6e' },
+  { id: 'kpop',          name: 'K-Pop',                region: 'South Korea',     color: '#fd79a8' },
+  { id: 'afrobeat',      name: 'Afrobeat',             region: 'West Africa',     color: '#e17055' },
+  { id: 'bossa_nova',    name: 'Bossa Nova',           region: 'Brazil',          color: '#74b9ff' },
+  { id: 'flamenco',      name: 'Flamenco',             region: 'Spain',           color: '#d63031' },
+  { id: 'jpop',          name: 'J-Pop',                region: 'Japan',           color: '#ff7675' },
+  { id: 'qawwali',       name: 'Qawwali',              region: 'Pakistan',        color: '#a29bfe' },
+  { id: 'american_rock', name: 'American Rock',        region: 'USA',             color: '#636e72' },
+
+  // ── Tier 2: Common Spotify genre labels (display polish for the 1097-track Spotify pool) ──
+  // Spotify uses its own id for k-pop ('k-pop' with hyphen), j-pop ('j-pop'), etc.
+  // We add aliases here rather than rewriting the data so both spellings work.
+  { id: 'k-pop',         name: 'K-Pop',                region: 'South Korea',     color: '#fd79a8' },
+  { id: 'j-pop',         name: 'J-Pop',                region: 'Japan',           color: '#ff7675' },
+  { id: 'j-rock',        name: 'J-Rock',               region: 'Japan',           color: '#ff6b6b' },
+  { id: 'j-dance',       name: 'J-Dance',              region: 'Japan',           color: '#fb6f92' },
+  { id: 'j-idol',        name: 'J-Idol',               region: 'Japan',           color: '#ffafcc' },
+  { id: 'mandopop',      name: 'Mandopop',             region: 'Greater China',   color: '#f48fb1' },
+  { id: 'cantopop',      name: 'Cantopop',             region: 'Hong Kong',       color: '#f06292' },
+  { id: 'indian',        name: 'Indian',               region: 'India',           color: '#ff9f43' },
+  { id: 'iranian',       name: 'Persian',              region: 'Iran',            color: '#06d6a0' },
+  { id: 'malay',         name: 'Malay',                region: 'Malaysia',        color: '#4ecdc4' },
+  { id: 'turkish',       name: 'Turkish',              region: 'Türkiye',         color: '#ef476f' },
+  { id: 'spanish',       name: 'Spanish',              region: 'Spain',           color: '#e63946' },
+  { id: 'french',        name: 'French',               region: 'France',          color: '#a8dadc' },
+  { id: 'german',        name: 'German',               region: 'Germany',         color: '#fcbf49' },
+  { id: 'swedish',       name: 'Swedish',              region: 'Sweden',          color: '#457b9d' },
+  { id: 'british',       name: 'British',              region: 'UK',              color: '#1d3557' },
+  { id: 'latin',         name: 'Latin',                region: 'Latin America',   color: '#f4a261' },
+  { id: 'latino',        name: 'Latino',               region: 'Latin America',   color: '#e76f51' },
+  { id: 'samba',         name: 'Samba',                region: 'Brazil',          color: '#06aed5' },
+  { id: 'pagode',        name: 'Pagode',               region: 'Brazil',          color: '#0096c7' },
+  { id: 'forro',         name: 'Forró',                region: 'Brazil',          color: '#0077b6' },
+  { id: 'mpb',           name: 'MPB',                  region: 'Brazil',          color: '#48cae4' },
+  { id: 'sertanejo',     name: 'Sertanejo',            region: 'Brazil',          color: '#90e0ef' },
+  { id: 'brazil',        name: 'Brazilian',            region: 'Brazil',          color: '#74b9ff' },
+  { id: 'salsa',         name: 'Salsa',                region: 'Caribbean',       color: '#f72585' },
+  { id: 'tango',         name: 'Tango',                region: 'Argentina',       color: '#b5179e' },
+  { id: 'reggae',        name: 'Reggae',               region: 'Jamaica',         color: '#7209b7' },
+  { id: 'dancehall',     name: 'Dancehall',            region: 'Jamaica',         color: '#560bad' },
+  { id: 'opera',         name: 'Opera',                region: 'Europe',          color: '#9d4edd' },
+  { id: 'classical',     name: 'Classical',            region: 'Global',          color: '#c77dff' },
+  { id: 'jazz',          name: 'Jazz',                 region: 'USA',             color: '#5e548e' },
+  { id: 'blues',         name: 'Blues',                region: 'USA',             color: '#22577a' },
+  { id: 'soul',          name: 'Soul',                 region: 'USA',             color: '#38a3a5' },
+  { id: 'r-n-b',         name: 'R&B',                  region: 'USA',             color: '#57cc99',},
+  { id: 'hip-hop',       name: 'Hip-Hop',              region: 'USA',             color: '#80ed99' },
+  { id: 'country',       name: 'Country',              region: 'USA',             color: '#c9ada7' },
+  { id: 'bluegrass',     name: 'Bluegrass',            region: 'USA',             color: '#9a8c98' },
+  { id: 'honky-tonk',    name: 'Honky-Tonk',           region: 'USA',             color: '#8d6e63' },
+  { id: 'rockabilly',    name: 'Rockabilly',           region: 'USA',             color: '#795548' },
+  { id: 'gospel',        name: 'Gospel',               region: 'USA',             color: '#fdcb6e' }, // alias OK
+  { id: 'disco',         name: 'Disco',                region: 'USA',             color: '#f4845f' },
+  { id: 'funk',          name: 'Funk',                 region: 'USA',             color: '#f48c06' },
+  { id: 'pop',           name: 'Pop',                  region: 'Global',          color: '#ff7d00' },
+  { id: 'rock',          name: 'Rock',                 region: 'Global',          color: '#6c757d' },
+  { id: 'hard-rock',     name: 'Hard Rock',            region: 'Global',          color: '#495057' },
+  { id: 'alt-rock',      name: 'Alt-Rock',             region: 'Global',          color: '#343a40' },
+  { id: 'indie',         name: 'Indie',                region: 'Global',          color: '#ced4da' },
+  { id: 'indie-pop',     name: 'Indie Pop',            region: 'Global',          color: '#dee2e6' },
+  { id: 'singer-songwriter', name: 'Singer-Songwriter',region: 'Global',          color: '#adb5bd' },
+  { id: 'folk',          name: 'Folk',                 region: 'Global',          color: '#b08968' },
+  { id: 'edm',           name: 'EDM',                  region: 'Global',          color: '#00f5ff' },
+  { id: 'electronic',    name: 'Electronic',           region: 'Global',          color: '#00bfff' },
+  { id: 'electro',       name: 'Electro',              region: 'Global',          color: '#00aaff' },
+  { id: 'house',         name: 'House',                region: 'Global',          color: '#0095ff' },
+  { id: 'deep-house',    name: 'Deep House',           region: 'Global',          color: '#0077b6' },
+  { id: 'techno',        name: 'Techno',               region: 'Germany',         color: '#003566' },
+  { id: 'trance',        name: 'Trance',               region: 'Global',          color: '#001d3d' },
+  { id: 'dubstep',       name: 'Dubstep',              region: 'UK',              color: '#000814' },
+  { id: 'drum-and-bass', name: 'Drum & Bass',          region: 'UK',              color: '#3a0ca3' },
+  { id: 'ambient',       name: 'Ambient',              region: 'Global',          color: '#d8e2dc' },
+  { id: 'chill',         name: 'Chill',                region: 'Global',          color: '#cdb4db' },
+  { id: 'piano',         name: 'Piano',                region: 'Global',          color: '#e0aaff' },
+  { id: 'metal',         name: 'Metal',                region: 'Global',          color: '#212529' },
+  { id: 'heavy-metal',   name: 'Heavy Metal',          region: 'Global',          color: '#1a1d20' },
+  { id: 'death-metal',   name: 'Death Metal',          region: 'Global',          color: '#0d1117' },
+  { id: 'black-metal',   name: 'Black Metal',          region: 'Norway',          color: '#161b22' },
+  { id: 'metalcore',     name: 'Metalcore',            region: 'Global',          color: '#21262d' },
+  { id: 'grunge',        name: 'Grunge',               region: 'USA',             color: '#30363d' },
+  { id: 'punk',          name: 'Punk',                 region: 'UK',              color: '#bc3908' },
+  { id: 'punk-rock',     name: 'Punk Rock',            region: 'UK',              color: '#9e2a0f' },
+  { id: 'emo',           name: 'Emo',                  region: 'Global',          color: '#7b2cbf' },
+  { id: 'world-music',   name: 'World Music',          region: 'Global',          color: '#f9c74f' },
 ];
 
 // Track pool now lives in ./utils/tracksDatabase.js (curated 100-track baseline,
@@ -451,15 +543,37 @@ export default function EarCandy() {
     const variety = Math.random() * 15;
     const score = proximityScore + labelMatch + variety;
 
+    // Build a human-readable reason — calibrated for the ~1,200-track dense pool.
+    // Finer proximity tiers (5 instead of 3) and tighter delta thresholds (0.07
+    // vs 0.15) so the descriptors stay varied even when the pool is rich enough
+    // that most surfaced tracks have proximity > 0.85.
     const reasons = [];
-    if (proximity > 0.85) reasons.push('strong mood fit');
-    else if (proximity > 0.65) reasons.push('close to your mood');
+    if (proximity > 0.97) reasons.push('almost exact match');
+    else if (proximity > 0.93) reasons.push('strong mood fit');
+    else if (proximity > 0.85) reasons.push('close to your mood');
+    else if (proximity > 0.70) reasons.push('in the neighborhood');
     else reasons.push('related mood');
+
     if (labelMatch) reasons.push(`tagged ${namedMatchId}`);
-    if (track.valence > tv + 0.15) reasons.push('a bit brighter');
-    else if (track.valence < tv - 0.15) reasons.push('a bit darker');
-    if (track.energy > te + 0.15) reasons.push('higher energy');
-    else if (track.energy < te - 0.15) reasons.push('lower energy');
+
+    // Per-axis leans — tighter threshold so subtle leans get described.
+    // Magnitude tiers ("nudges" vs "much" vs "noticeably") give richer wording.
+    const dvAbs = Math.abs(dv);
+    if (dvAbs > 0.20) reasons.push(dv > 0 ? 'much brighter' : 'much darker');
+    else if (dvAbs > 0.10) reasons.push(dv > 0 ? 'a bit brighter' : 'a bit darker');
+    else if (dvAbs > 0.05) reasons.push(dv > 0 ? 'nudges brighter' : 'nudges darker');
+
+    const deAbs = Math.abs(den);
+    if (deAbs > 0.20) reasons.push(den > 0 ? 'noticeably higher energy' : 'noticeably lower energy');
+    else if (deAbs > 0.10) reasons.push(den > 0 ? 'higher energy' : 'lower energy');
+    else if (deAbs > 0.05) reasons.push(den > 0 ? 'a touch livelier' : 'a touch mellower');
+
+    // Quadrant flavour — describes the *kind* of affect when notable.
+    // The four Russell quadrants each suggest a distinct feel.
+    if (track.valence > 0.7 && track.energy > 0.7) reasons.push('upbeat / euphoric');
+    else if (track.valence > 0.7 && track.energy < 0.4) reasons.push('peaceful / content');
+    else if (track.valence < 0.4 && track.energy > 0.7) reasons.push('tense / anxious');
+    else if (track.valence < 0.4 && track.energy < 0.4) reasons.push('reflective / wistful');
 
     return { ...track, score, distance, proximity, reason: reasons.join(' • ') };
   }, []);
