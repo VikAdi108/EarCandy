@@ -35,6 +35,33 @@ const moods = [
   { id: 'romantic', emoji: '💫', label: 'Romantic', color: '#f472b6', valence: 0.7, energy: 0.4 },
 ];
 
+// Time-of-day default mood: rough psychological priors based on diurnal rhythm.
+// Cortisol peaks in the morning (high energy), tapers through the day, and
+// reflection/melancholy tend to land in the late hours. We use these as a
+// starting marker position — the user can still drag anywhere.
+function getDefaultMoodForHour(hour) {
+  if (hour >= 5 && hour < 10)  return { valence: 0.70, energy: 0.65, label: 'Morning' };
+  if (hour >= 10 && hour < 14) return { valence: 0.60, energy: 0.55, label: 'Midday' };
+  if (hour >= 14 && hour < 17) return { valence: 0.60, energy: 0.40, label: 'Afternoon' };
+  if (hour >= 17 && hour < 21) return { valence: 0.65, energy: 0.45, label: 'Evening' };
+  if (hour >= 21 || hour < 1)  return { valence: 0.50, energy: 0.30, label: 'Night' };
+  return { valence: 0.35, energy: 0.30, label: 'Late Night' }; // 1-5
+}
+
+// Find the closest named mood for a given (v, e) point — used to label
+// arbitrary positions on the grid with a friendly name.
+function nearestNamedMood(valence, energy) {
+  let best = moods[0];
+  let bestDist = Infinity;
+  for (const m of moods) {
+    const dv = m.valence - valence;
+    const de = m.energy - energy;
+    const d = Math.sqrt(dv * dv + de * de);
+    if (d < bestDist) { bestDist = d; best = m; }
+  }
+  return { mood: best, distance: bestDist };
+}
+
 // Global genre database representing diverse musical traditions
 const globalGenres = [
   { id: 'carnatic', name: 'Carnatic Classical', region: 'South India', color: '#ff9f43' },
@@ -82,11 +109,28 @@ const sampleTracks = [
 export default function EarCandy() {
   // State management
   const [isRecording, setIsRecording] = useState(false);
+  // Refs for the 2D mood-grid drag interaction
+  const moodGridRef = useRef(null);
+  const [draggingMarker, setDraggingMarker] = useState(null); // 'current' | 'desired' | null
+
   const [audioBlob, setAudioBlob] = useState(null);
   const [pitchData, setPitchData] = useState([]);
   const [currentPitch, setCurrentPitch] = useState(null);
   const [currentNote, setCurrentNote] = useState(null);
-  const [selectedMood, setSelectedMood] = useState(null);
+  // Note: removed `selectedMood` label state — the affect-space marker
+  // (moodPosition) is now the single source of truth. Preset buttons compute
+  // their active style from nearestNamedMood(moodPosition).
+  // 2D affect-space picker state. Default to a time-of-day-appropriate point so
+  // the grid isn't blank on first visit. valence/energy both 0..1.
+  const [moodPosition, setMoodPosition] = useState(() => {
+    const hour = new Date().getHours();
+    const d = getDefaultMoodForHour(hour);
+    return { valence: d.valence, energy: d.energy };
+  });
+  // Journey mode: when on, recommendations interpolate from current → desired
+  // mood across the playlist (mood-regulation arc, à la mood-repair theory).
+  const [useJourney, setUseJourney] = useState(false);
+  const [desiredMood, setDesiredMood] = useState({ valence: 0.8, energy: 0.7 });
   const [recommendations, setRecommendations] = useState([]);
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [activeTab, setActiveTab] = useState('record'); // record, mood, results, recognition
@@ -405,78 +449,125 @@ export default function EarCandy() {
     }
   }, [quantizedNotes, audioBlob]);
 
-  // Generate recommendations using affect-space proximity (Russell's circumplex).
-  // Each track lives at a (valence, energy) point in the unit square. The selected
-  // mood also lives at a point. Score = how close the track is to that point,
-  // weighted against genre diversity and a small randomness term for variety.
-  const generateRecommendations = useCallback(() => {
-    if (!selectedMood) return;
-
-    const targetMood = moods.find(m => m.id === selectedMood);
-    if (!targetMood) return;
-    const { valence: tv, energy: te } = targetMood;
-
-    // Euclidean distance in (valence, energy) space, normalized to 0..1.
-    // sqrt(2) is the max possible distance (corner-to-corner of the unit square).
+  // Score a single track against a (valence, energy) target. Pure, reusable —
+  // called once for single-mood mode, six times (one per waypoint) for journey
+  // mode. Returns the track decorated with score, proximity, and a reason string.
+  const scoreTrackAgainstTarget = useCallback((track, tv, te, namedMatchId) => {
     const SQRT2 = Math.SQRT2;
+    const dv = track.valence - tv;
+    const den = track.energy - te;
+    const distance = Math.sqrt(dv * dv + den * den);
+    const proximity = 1 - distance / SQRT2;
 
-    const scored = sampleTracks.map(track => {
-      const dv = track.valence - tv;
-      const den = track.energy - te;
-      const distance = Math.sqrt(dv * dv + den * den);  // 0 (perfect) .. sqrt(2) (worst)
-      const proximity = 1 - distance / SQRT2;            // 1 (perfect) .. 0 (worst)
+    const proximityScore = proximity * 70;
+    const labelMatch = namedMatchId && track.mood === namedMatchId ? 15 : 0;
+    const variety = Math.random() * 15;
+    const score = proximityScore + labelMatch + variety;
 
-      // Components (each contributes to a 0..100 final score):
-      //   proximity:  70 — how close the track sits to the requested mood
-      //   labelMatch: 15 — small bonus if the track's named mood matches exactly
-      //   variety:    15 — randomness so identical-score tracks don't always tie the same way
-      const proximityScore = proximity * 70;
-      const labelMatch = track.mood === selectedMood ? 15 : 0;
-      const variety = Math.random() * 15;
+    const reasons = [];
+    if (proximity > 0.85) reasons.push('strong mood fit');
+    else if (proximity > 0.65) reasons.push('close to your mood');
+    else reasons.push('related mood');
+    if (labelMatch) reasons.push(`tagged ${namedMatchId}`);
+    if (track.valence > tv + 0.15) reasons.push('a bit brighter');
+    else if (track.valence < tv - 0.15) reasons.push('a bit darker');
+    if (track.energy > te + 0.15) reasons.push('higher energy');
+    else if (track.energy < te - 0.15) reasons.push('lower energy');
 
-      const score = proximityScore + labelMatch + variety;
+    return { ...track, score, distance, proximity, reason: reasons.join(' • ') };
+  }, []);
 
-      // Build a human-readable explanation of why this track surfaced.
-      const reasons = [];
-      if (proximity > 0.85) reasons.push('strong mood fit');
-      else if (proximity > 0.65) reasons.push('close to your mood');
-      else reasons.push('related mood');
-      if (labelMatch) reasons.push(`tagged ${targetMood.label.toLowerCase()}`);
-      if (track.valence > tv + 0.15) reasons.push('a bit brighter');
-      else if (track.valence < tv - 0.15) reasons.push('a bit darker');
-      if (track.energy > te + 0.15) reasons.push('higher energy');
-      else if (track.energy < te - 0.15) reasons.push('lower energy');
+  // Generate recommendations using affect-space proximity (Russell's circumplex).
+  //
+  // Single-mood mode: the marker is one point; score every track against it,
+  //   pick the top 6 with light genre diversity.
+  //
+  // Journey mode: a path from currentMarker → desiredMarker. We sample 6
+  //   waypoints along that path and pick the closest unused track to each.
+  //   The playlist becomes a mood-regulation arc (Knobloch 2003, mood repair).
+  const generateRecommendations = useCallback(() => {
+    const tv = moodPosition.valence;
+    const te = moodPosition.energy;
+    const matchedNamed = nearestNamedMood(tv, te);
+    const namedMatchId = matchedNamed.distance < 0.12 ? matchedNamed.mood.id : null;
 
-      return {
-        ...track,
-        score,
-        distance,
-        proximity,
-        reason: reasons.join(' • '),
-      };
-    });
+    let selected;
 
-    // Rank by score, then pick 6 with light genre diversity (no more than 2 per genre
-    // until we've drawn from at least 4 different genres).
-    scored.sort((a, b) => b.score - a.score);
-    const selected = [];
-    const genreCounts = new Map();
-    for (const track of scored) {
-      if (selected.length >= 6) break;
-      const count = genreCounts.get(track.genre) || 0;
-      const enoughDiversity = genreCounts.size >= 4;
-      if (count < 2 || enoughDiversity) {
-        selected.push(track);
-        genreCounts.set(track.genre, count + 1);
+    if (useJourney) {
+      // Sample 6 waypoints along the (current → desired) line in affect-space.
+      const playlistLen = 6;
+      const usedIds = new Set();
+      selected = [];
+      for (let i = 0; i < playlistLen; i++) {
+        const t = i / (playlistLen - 1);
+        const wv = tv + (desiredMood.valence - tv) * t;
+        const we = te + (desiredMood.energy - te) * t;
+        // Score every remaining track against this waypoint, take the best.
+        const candidates = sampleTracks
+          .filter(track => !usedIds.has(track.id))
+          .map(track => scoreTrackAgainstTarget(track, wv, we, namedMatchId))
+          .sort((a, b) => b.score - a.score);
+        if (candidates.length === 0) break;
+        const pick = candidates[0];
+        usedIds.add(pick.id);
+        // Annotate the journey position so the UI can show 'step 1 of 6 →' etc.
+        pick.journeyStep = i + 1;
+        pick.journeyTotal = playlistLen;
+        selected.push(pick);
       }
+      console.log(`💭 Journey: (v=${tv.toFixed(2)},e=${te.toFixed(2)}) → (v=${desiredMood.valence.toFixed(2)},e=${desiredMood.energy.toFixed(2)})`);
+    } else {
+      // Single-mood mode: score all tracks against the one marker, take top 6
+      // with light genre diversity.
+      const scored = sampleTracks
+        .map(track => scoreTrackAgainstTarget(track, tv, te, namedMatchId))
+        .sort((a, b) => b.score - a.score);
+
+      selected = [];
+      const genreCounts = new Map();
+      for (const track of scored) {
+        if (selected.length >= 6) break;
+        const count = genreCounts.get(track.genre) || 0;
+        const enoughDiversity = genreCounts.size >= 4;
+        if (count < 2 || enoughDiversity) {
+          selected.push(track);
+          genreCounts.set(track.genre, count + 1);
+        }
+      }
+      console.log(`💭 Mood: (v=${tv.toFixed(2)}, e=${te.toFixed(2)}) ≈ ${matchedNamed.mood.label}`);
     }
 
-    console.log(`💭 Mood: ${targetMood.label} (v=${tv}, e=${te})`);
-    console.log('🎶 Recommendations:', selected.map(t => `${t.title} [prox=${t.proximity.toFixed(2)}, score=${t.score.toFixed(1)}]`));
-
+    console.log('🎶 Recommendations:', selected.map(t => `${t.title} [prox=${t.proximity.toFixed(2)}]`));
     setRecommendations(selected);
     setActiveTab('results');
-  }, [selectedMood]);
+  }, [moodPosition, desiredMood, useJourney, scoreTrackAgainstTarget]);
+
+  // While a marker is being dragged, listen to window-level pointer events so
+  // the drag keeps working even if the cursor briefly leaves the grid bounds.
+  // Maps cursor position to (valence, energy) by reading the grid's rect.
+  useEffect(() => {
+    if (!draggingMarker) return;
+
+    const handleMove = (e) => {
+      if (!moodGridRef.current) return;
+      const rect = moodGridRef.current.getBoundingClientRect();
+      const cx = e.clientX ?? e.touches?.[0]?.clientX;
+      const cy = e.clientY ?? e.touches?.[0]?.clientY;
+      if (cx == null) return;
+      const valence = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
+      const energy = Math.max(0, Math.min(1, 1 - (cy - rect.top) / rect.height));
+      if (draggingMarker === 'current') setMoodPosition({ valence, energy });
+      else if (draggingMarker === 'desired') setDesiredMood({ valence, energy });
+    };
+    const handleUp = () => setDraggingMarker(null);
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+  }, [draggingMarker]);
 
   // Reset everything
   const reset = () => {
@@ -485,8 +576,8 @@ export default function EarCandy() {
     pitchDataRef.current = [];
     setCurrentPitch(null);
     setCurrentNote(null);
-    setSelectedMood(null);
     setRecommendations([]);
+    setUseJourney(false);
     setAnalysisComplete(false);
     setDetectedFeatures(null);
     setQuantizedNotes(null);
@@ -1148,7 +1239,12 @@ export default function EarCandy() {
         )}
 
         {/* Mood Tab */}
-        {activeTab === 'mood' && (
+        {activeTab === 'mood' && (() => {
+          const hour = new Date().getHours();
+          const timeDefault = getDefaultMoodForHour(hour);
+          const closest = nearestNamedMood(moodPosition.valence, moodPosition.energy);
+          const closestDesired = nearestNamedMood(desiredMood.valence, desiredMood.energy);
+          return (
           <div style={{ animation: 'slideUp 0.5s ease' }}>
             <div style={{
               background: colors.cardBg,
@@ -1160,87 +1256,239 @@ export default function EarCandy() {
               <h3 style={{ margin: '0 0 10px 0', fontSize: '1.5rem' }}>
                 How are you feeling?
               </h3>
-              <p style={{ color: colors.textMuted, marginBottom: '30px' }}>
-                Your mood helps us understand what music might resonate with you
+              <p style={{ color: colors.textMuted, marginBottom: '20px' }}>
+                Place yourself in affect-space — valence (sad ↔ happy) and energy (calm ↔ intense).
               </p>
-              
+
+              {/* Time-of-day banner */}
               <div style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(3, 1fr)',
-                gap: '15px',
-                maxWidth: '500px',
-                margin: '0 auto 30px'
+                display: 'inline-block',
+                padding: '8px 16px',
+                borderRadius: '20px',
+                background: 'rgba(96,165,250,0.12)',
+                color: colors.accent,
+                fontSize: '0.8rem',
+                marginBottom: '24px'
               }}>
-                {moods.map(mood => (
-                  <button
-                    key={mood.id}
-                    onClick={() => setSelectedMood(mood.id)}
-                    style={{
-                      padding: '20px 15px',
-                      borderRadius: '16px',
-                      border: selectedMood === mood.id 
-                        ? `2px solid ${mood.color}` 
-                        : `1px solid ${colors.cardBorder}`,
-                      background: selectedMood === mood.id 
-                        ? `${mood.color}20` 
-                        : colors.cardBg,
-                      cursor: 'pointer',
-                      transition: 'all 0.3s ease',
-                      transform: selectedMood === mood.id ? 'scale(1.05)' : 'scale(1)'
-                    }}
-                  >
-                    <div style={{ fontSize: '2rem', marginBottom: '8px' }}>{mood.emoji}</div>
-                    <div style={{ 
-                      color: selectedMood === mood.id ? mood.color : colors.text,
-                      fontWeight: 500
-                    }}>
-                      {mood.label}
-                    </div>
-                  </button>
-                ))}
+                🕐 {timeDefault.label} — defaulted you near “{nearestNamedMood(timeDefault.valence, timeDefault.energy).mood.label}”
               </div>
 
-              {selectedMood && (
-                <div style={{
-                  padding: '20px',
-                  background: 'rgba(168, 85, 247, 0.1)',
-                  borderRadius: '12px',
-                  marginBottom: '30px',
-                  fontSize: '0.85rem',
-                  color: colors.textMuted,
-                  lineHeight: 1.6
+              {/* Mood preset row — clicking sets the current marker position */}
+              <div style={{
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: '8px',
+                justifyContent: 'center',
+                marginBottom: '24px'
+              }}>
+                {moods.map(mood => {
+                  const active = closest.mood.id === mood.id && closest.distance < 0.08;
+                  return (
+                    <button
+                      key={mood.id}
+                      onClick={() => setMoodPosition({ valence: mood.valence, energy: mood.energy })}
+                      style={{
+                        padding: '8px 14px',
+                        borderRadius: '20px',
+                        border: active ? `2px solid ${mood.color}` : `1px solid ${colors.cardBorder}`,
+                        background: active ? `${mood.color}22` : colors.cardBg,
+                        cursor: 'pointer',
+                        fontSize: '0.85rem',
+                        color: active ? mood.color : colors.text,
+                        fontFamily: 'inherit'
+                      }}
+                    >
+                      {mood.emoji} {mood.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Journey-mode toggle */}
+              <div style={{ marginBottom: '20px' }}>
+                <label style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                  padding: '8px 16px',
+                  borderRadius: '20px',
+                  background: useJourney ? `${colors.purple}22` : colors.cardBg,
+                  border: `1px solid ${useJourney ? colors.purple : colors.cardBorder}`,
+                  cursor: 'pointer',
+                  fontSize: '0.85rem'
                 }}>
-                  <strong style={{ color: colors.purple }}>Psychology Layer:</strong> Mood affects music perception through 
-                  the dimensional model of affect (valence × arousal). Your "{moods.find(m => m.id === selectedMood)?.label}" mood 
-                  suggests preferences for music with {moods.find(m => m.id === selectedMood)?.energy > 0.5 ? 'higher' : 'lower'} energy 
-                  and {moods.find(m => m.id === selectedMood)?.valence > 0.5 ? 'positive' : 'introspective'} emotional tone.
-                </div>
-              )}
-              
+                  <input
+                    type="checkbox"
+                    checked={useJourney}
+                    onChange={(e) => setUseJourney(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Journey mode — playlist as a path from where you are to where you want to be
+                </label>
+              </div>
+
+              {/* The 2D affect-space grid */}
+              <div
+                ref={moodGridRef}
+                style={{
+                  position: 'relative',
+                  width: '100%',
+                  maxWidth: '420px',
+                  aspectRatio: '1 / 1',
+                  margin: '0 auto 20px',
+                  borderRadius: '16px',
+                  background: `linear-gradient(135deg,
+                    rgba(168,85,247,0.18) 0%,
+                    rgba(255,107,107,0.18) 50%,
+                    rgba(255,230,109,0.18) 100%)`,
+                  border: `1px solid ${colors.cardBorder}`,
+                  touchAction: 'none',
+                  userSelect: 'none'
+                }}
+              >
+                {/* Axis labels */}
+                <div style={{ position: 'absolute', left: '8px', top: '50%', transform: 'translateY(-50%)', fontSize: '0.7rem', color: colors.textMuted, writingMode: 'vertical-rl' }}>← calm    energy    intense →</div>
+                <div style={{ position: 'absolute', bottom: '8px', left: '50%', transform: 'translateX(-50%)', fontSize: '0.7rem', color: colors.textMuted }}>← sad    valence    happy →</div>
+
+                {/* Named mood anchors */}
+                {moods.map(mood => (
+                  <div
+                    key={mood.id}
+                    style={{
+                      position: 'absolute',
+                      left: `${mood.valence * 100}%`,
+                      bottom: `${mood.energy * 100}%`,
+                      transform: 'translate(-50%, 50%)',
+                      pointerEvents: 'none',
+                      fontSize: '0.7rem',
+                      color: mood.color,
+                      opacity: 0.7,
+                      textAlign: 'center'
+                    }}
+                  >
+                    <div style={{ fontSize: '1.1rem' }}>{mood.emoji}</div>
+                    <div>{mood.label}</div>
+                  </div>
+                ))}
+
+                {/* Path line for journey mode */}
+                {useJourney && (
+                  <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+                    <line
+                      x1={`${moodPosition.valence * 100}%`}
+                      y1={`${(1 - moodPosition.energy) * 100}%`}
+                      x2={`${desiredMood.valence * 100}%`}
+                      y2={`${(1 - desiredMood.energy) * 100}%`}
+                      stroke={colors.purple}
+                      strokeWidth="2"
+                      strokeDasharray="4 4"
+                    />
+                  </svg>
+                )}
+
+                {/* Current-mood marker (draggable) */}
+                <div
+                  onPointerDown={(e) => { e.preventDefault(); setDraggingMarker('current'); }}
+                  style={{
+                    position: 'absolute',
+                    left: `${moodPosition.valence * 100}%`,
+                    bottom: `${moodPosition.energy * 100}%`,
+                    transform: 'translate(-50%, 50%)',
+                    width: '28px',
+                    height: '28px',
+                    borderRadius: '50%',
+                    background: colors.primary,
+                    border: `3px solid white`,
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                    cursor: draggingMarker === 'current' ? 'grabbing' : 'grab',
+                    touchAction: 'none'
+                  }}
+                  title="Drag — this is where you are now"
+                />
+
+                {/* Desired-mood marker (only in journey mode, also draggable) */}
+                {useJourney && (
+                  <div
+                    onPointerDown={(e) => { e.preventDefault(); setDraggingMarker('desired'); }}
+                    style={{
+                      position: 'absolute',
+                      left: `${desiredMood.valence * 100}%`,
+                      bottom: `${desiredMood.energy * 100}%`,
+                      transform: 'translate(-50%, 50%)',
+                      width: '28px',
+                      height: '28px',
+                      borderRadius: '50%',
+                      background: colors.purple,
+                      border: `3px solid white`,
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                      cursor: draggingMarker === 'desired' ? 'grabbing' : 'grab',
+                      touchAction: 'none'
+                    }}
+                    title="Drag — this is where you want to go"
+                  />
+                )}
+              </div>
+
+              {/* Live coordinate readout */}
+              <div style={{
+                padding: '14px',
+                background: 'rgba(168,85,247,0.08)',
+                borderRadius: '12px',
+                marginBottom: '20px',
+                fontSize: '0.85rem',
+                color: colors.textMuted,
+                lineHeight: 1.6
+              }}>
+                <strong style={{ color: colors.primary }}>You are here:</strong>
+                {' '}{closest.mood.label.toLowerCase()} (v={moodPosition.valence.toFixed(2)}, e={moodPosition.energy.toFixed(2)})
+                {useJourney && (
+                  <>
+                    {' → '}
+                    <strong style={{ color: colors.purple }}>heading toward:</strong>
+                    {' '}{closestDesired.mood.label.toLowerCase()} (v={desiredMood.valence.toFixed(2)}, e={desiredMood.energy.toFixed(2)})
+                  </>
+                )}
+              </div>
+
               <button
                 onClick={generateRecommendations}
-                disabled={!selectedMood}
                 style={{
                   padding: '15px 40px',
                   borderRadius: '30px',
                   border: 'none',
-                  background: selectedMood 
-                    ? `linear-gradient(135deg, ${colors.primary}, ${colors.purple})` 
-                    : colors.cardBg,
-                  color: selectedMood ? 'white' : colors.textMuted,
+                  background: `linear-gradient(135deg, ${colors.primary}, ${colors.purple})`,
+                  color: 'white',
                   fontSize: '1.1rem',
                   fontWeight: 600,
-                  cursor: selectedMood ? 'pointer' : 'not-allowed',
-                  opacity: selectedMood ? 1 : 0.5,
+                  cursor: 'pointer',
                   transition: 'all 0.3s ease',
                   fontFamily: 'inherit'
                 }}
               >
                 🌍 Discover Global Music
               </button>
+
+              {/* Mood-repair theory footnote — explains why "journey mode" exists */}
+              <div style={{
+                marginTop: '28px',
+                padding: '18px 22px',
+                background: 'rgba(168, 85, 247, 0.10)',
+                borderLeft: `3px solid ${colors.purple}`,
+                borderRadius: '8px',
+                fontSize: '0.85rem',
+                color: colors.textMuted,
+                lineHeight: 1.6,
+                textAlign: 'left'
+              }}>
+                <strong style={{ color: colors.purple }}>Why "journey mode"?</strong>{' '}
+                This is based on <em>mood-repair theory</em> (Knobloch 2003) — people
+                don't just want music that <em>matches</em> their current mood, they
+                want music that <em>moves them toward</em> a target mood.
+              </div>
             </div>
           </div>
-        )}
+          );
+        })()}
 
         {/* Results Tab */}
         {activeTab === 'results' && recommendations.length > 0 && (
@@ -1261,7 +1509,9 @@ export default function EarCandy() {
                 marginBottom: '25px',
                 fontSize: '0.9rem'
               }}>
-                Matched to your {moods.find(m => m.id === selectedMood)?.label.toLowerCase()} mood
+                {useJourney
+                  ? `Journey: ${nearestNamedMood(moodPosition.valence, moodPosition.energy).mood.label.toLowerCase()} → ${nearestNamedMood(desiredMood.valence, desiredMood.energy).mood.label.toLowerCase()}`
+                  : `Matched to your ${nearestNamedMood(moodPosition.valence, moodPosition.energy).mood.label.toLowerCase()} mood`}
               </p>
               
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
@@ -1420,9 +1670,12 @@ export default function EarCandy() {
                   borderRadius: '12px' 
                 }}>
                   <strong style={{ color: colors.purple }}>Psychology Match:</strong><br/>
-                  Filtered for {moods.find(m => m.id === selectedMood)?.label.toLowerCase()} mood 
-                  using valence ({moods.find(m => m.id === selectedMood)?.valence}) and 
-                  energy ({moods.find(m => m.id === selectedMood)?.energy}) dimensions.
+                  Scored by Euclidean proximity in Russell's circumplex —
+                  your point ({moodPosition.valence.toFixed(2)}, {moodPosition.energy.toFixed(2)})
+                  {useJourney && (
+                    <> → ({desiredMood.valence.toFixed(2)}, {desiredMood.energy.toFixed(2)})</>
+                  )}
+                  {' '}in (valence, energy) space.
                 </div>
               </div>
               <div style={{ 
