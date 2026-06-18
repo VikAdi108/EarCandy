@@ -1282,8 +1282,9 @@ export default function EarCandy() {
                         animationFillMode: 'both'
                       }}
                     >
-                      {/* Genre color indicator */}
+                      {/* Genre color indicator with mood-match rating */}
                       <div style={{
+                        position: 'relative',
                         width: '50px',
                         height: '50px',
                         borderRadius: '10px',
@@ -1295,6 +1296,32 @@ export default function EarCandy() {
                         flexShrink: 0
                       }}>
                         🎵
+                        {/* Match-rating badge — % proximity in valence-energy space */}
+                        {typeof track.proximity === 'number' && (
+                          <div style={{
+                            position: 'absolute',
+                            bottom: '-6px',
+                            right: '-6px',
+                            minWidth: '28px',
+                            height: '20px',
+                            padding: '0 6px',
+                            borderRadius: '10px',
+                            background:
+                              track.proximity > 0.85 ? colors.primary
+                              : track.proximity > 0.65 ? colors.accent
+                              : colors.purple,
+                            color: 'white',
+                            fontSize: '0.7rem',
+                            fontWeight: 700,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            border: `2px solid ${colors.bg}`,
+                            lineHeight: 1
+                          }}>
+                            {Math.round(track.proximity * 100)}
+                          </div>
+                        )}
                       </div>
                       
                       {/* Track info */}
