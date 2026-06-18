@@ -57,6 +57,16 @@ function getDefaultMoodForHour(hour) {
   return { valence: 0.35, energy: 0.30, label: 'Late Night' }; // 1-5
 }
 
+// Pretty-print a raw genre id like "psych-rock" or "alt-rock" into "Psych Rock"
+// for tracks whose genre we don't have nice display info for in globalGenres.
+function formatGenreId(id) {
+  if (!id) return 'Global';
+  return id
+    .split('-')
+    .map(w => w[0] ? w[0].toUpperCase() + w.slice(1) : w)
+    .join(' ');
+}
+
 // Find the closest named mood for a given (v, e) point — used to label
 // arbitrary positions on the grid with a friendly name.
 function nearestNamedMood(valence, energy) {
@@ -211,6 +221,9 @@ export default function EarCandy() {
   const [useJourney, setUseJourney] = useState(false);
   const [desiredMood, setDesiredMood] = useState({ valence: 0.8, energy: 0.7 });
   const [recommendations, setRecommendations] = useState([]);
+  // Tracks the user has marked "less like this" / "skip" — excluded from future
+  // picks until reset. Set, not array, for O(1) membership checks in the scorer.
+  const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [activeTab, setActiveTab] = useState('record'); // record, mood, results, recognition
   const [detectedFeatures, setDetectedFeatures] = useState(null);
@@ -604,8 +617,9 @@ export default function EarCandy() {
         const wv = tv + (desiredMood.valence - tv) * t;
         const we = te + (desiredMood.energy - te) * t;
         // Score every remaining track against this waypoint, take the best.
+        // Exclude both within-playlist duplicates AND tracks the user has skipped.
         const candidates = sampleTracks
-          .filter(track => !usedIds.has(track.id))
+          .filter(track => !usedIds.has(track.id) && !skippedTrackIds.has(track.id))
           .map(track => scoreTrackAgainstTarget(track, wv, we, namedMatchId))
           .sort((a, b) => b.score - a.score);
         if (candidates.length === 0) break;
@@ -619,8 +633,9 @@ export default function EarCandy() {
       console.log(`💭 Journey: (v=${tv.toFixed(2)},e=${te.toFixed(2)}) → (v=${desiredMood.valence.toFixed(2)},e=${desiredMood.energy.toFixed(2)})`);
     } else {
       // Single-mood mode: score all tracks against the one marker, take top 6
-      // with light genre diversity.
+      // with light genre diversity. Skipped tracks are filtered out upstream.
       const scored = sampleTracks
+        .filter(track => !skippedTrackIds.has(track.id))
         .map(track => scoreTrackAgainstTarget(track, tv, te, namedMatchId))
         .sort((a, b) => b.score - a.score);
 
@@ -641,7 +656,49 @@ export default function EarCandy() {
     console.log('🎶 Recommendations:', selected.map(t => `${t.title} [prox=${t.proximity.toFixed(2)}]`));
     setRecommendations(selected);
     setActiveTab('results');
-  }, [moodPosition, desiredMood, useJourney, scoreTrackAgainstTarget]);
+  }, [moodPosition, desiredMood, useJourney, skippedTrackIds, scoreTrackAgainstTarget]);
+
+  // ─── Refinement controls (Stage 3c) ──────────────────────────────────────
+  //
+  // "More like this" pulls the marker 30% of the way toward the track's
+  //   position in (valence, energy) space — partial nudge so a single click
+  //   doesn't overshoot, and repeated clicks converge.
+  // "Less like this" pushes the marker 20% in the opposite direction AND adds
+  //   the track to the skip set so it can't resurface.
+  // "Skip" just adds to the skip set without nudging the marker (useful when
+  //   the marker is right but this specific track isn't).
+  // After any of these, recommendations are regenerated automatically so the
+  //   user sees the effect immediately.
+  const nudgeMarkerToward = useCallback((track) => {
+    setMoodPosition(prev => ({
+      valence: Math.max(0, Math.min(1, prev.valence + (track.valence - prev.valence) * 0.30)),
+      energy:  Math.max(0, Math.min(1, prev.energy  + (track.energy  - prev.energy)  * 0.30)),
+    }));
+  }, []);
+
+  const nudgeMarkerAway = useCallback((track) => {
+    setMoodPosition(prev => ({
+      valence: Math.max(0, Math.min(1, prev.valence + (prev.valence - track.valence) * 0.20)),
+      energy:  Math.max(0, Math.min(1, prev.energy  + (prev.energy  - track.energy)  * 0.20)),
+    }));
+    setSkippedTrackIds(prev => new Set(prev).add(track.id));
+  }, []);
+
+  const skipTrack = useCallback((track) => {
+    setSkippedTrackIds(prev => new Set(prev).add(track.id));
+  }, []);
+
+  const clearSkipped = useCallback(() => setSkippedTrackIds(new Set()), []);
+
+  // Auto-regenerate when the marker moves OR the skip set changes — but ONLY
+  // if the user is already on the results tab (i.e. they've already discovered
+  // once). This way nudge buttons feel instantaneous; first-time discover still
+  // requires the explicit "Discover" click.
+  useEffect(() => {
+    if (activeTab !== 'results') return;
+    generateRecommendations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moodPosition, desiredMood, skippedTrackIds]);
 
   // While a marker is being dragged, listen to window-level pointer events so
   // the drag keeps working even if the cursor briefly leaves the grid bounds.
@@ -679,6 +736,7 @@ export default function EarCandy() {
     setCurrentNote(null);
     setRecommendations([]);
     setUseJourney(false);
+    setSkippedTrackIds(new Set());
     setAnalysisComplete(false);
     setDetectedFeatures(null);
     setQuantizedNotes(null);
@@ -1614,7 +1672,42 @@ export default function EarCandy() {
                   ? `Journey: ${nearestNamedMood(moodPosition.valence, moodPosition.energy).mood.label.toLowerCase()} → ${nearestNamedMood(desiredMood.valence, desiredMood.energy).mood.label.toLowerCase()}`
                   : `Matched to your ${nearestNamedMood(moodPosition.valence, moodPosition.energy).mood.label.toLowerCase()} mood`}
               </p>
-              
+
+              {/* Skip-history indicator (Stage 3c). Only renders when at least
+                  one track has been hidden; lets the user reset and refresh. */}
+              {skippedTrackIds.size > 0 && (
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '10px',
+                  padding: '8px 16px',
+                  marginBottom: '20px',
+                  borderRadius: '20px',
+                  background: 'rgba(168,85,247,0.08)',
+                  border: `1px solid ${colors.cardBorder}`,
+                  fontSize: '0.8rem',
+                  color: colors.textMuted
+                }}>
+                  ⊘ {skippedTrackIds.size} track{skippedTrackIds.size === 1 ? '' : 's'} hidden
+                  <button
+                    onClick={clearSkipped}
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: colors.purple,
+                      cursor: 'pointer',
+                      fontSize: '0.8rem',
+                      textDecoration: 'underline',
+                      padding: 0,
+                      fontFamily: 'inherit'
+                    }}
+                  >
+                    bring them back
+                  </button>
+                </div>
+              )}
+
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 {recommendations.map((track, i) => {
                   const genre = globalGenres.find(g => g.id === track.genre);
@@ -1720,9 +1813,14 @@ export default function EarCandy() {
                         fontWeight: 500,
                         whiteSpace: 'nowrap'
                       }}>
-                        {genre?.region || 'Global'}
+                        {/* Genre + Region. Genre name is always shown so tracks
+                            like Pink Floyd read "Psych Rock" instead of just
+                            "Global"; region is appended only when we have it. */}
+                        {genre
+                          ? `${genre.name} • ${genre.region}`
+                          : formatGenreId(track.genre)}
                       </div>
-                      
+
                       {/* BPM */}
                       <div style={{
                         fontFamily: "'Space Mono', monospace",
@@ -1731,6 +1829,53 @@ export default function EarCandy() {
                         whiteSpace: 'nowrap'
                       }}>
                         {track.bpm} BPM
+                      </div>
+
+                      {/* Refinement controls (Stage 3c) — three small icon
+                          buttons. Hovering each one explains what it does. */}
+                      <div style={{ display: 'flex', gap: '6px', marginLeft: '6px' }}>
+                        <button
+                          onClick={() => nudgeMarkerToward(track)}
+                          title="More like this — pull mood toward this track"
+                          style={{
+                            width: '32px', height: '32px',
+                            borderRadius: '50%',
+                            border: `1px solid ${colors.cardBorder}`,
+                            background: 'rgba(255,107,107,0.08)',
+                            color: colors.primary,
+                            cursor: 'pointer',
+                            fontSize: '0.85rem',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}
+                        >❤</button>
+                        <button
+                          onClick={() => nudgeMarkerAway(track)}
+                          title="Less like this — push mood away and hide this track"
+                          style={{
+                            width: '32px', height: '32px',
+                            borderRadius: '50%',
+                            border: `1px solid ${colors.cardBorder}`,
+                            background: 'rgba(168,85,247,0.08)',
+                            color: colors.purple,
+                            cursor: 'pointer',
+                            fontSize: '0.85rem',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}
+                        >👎</button>
+                        <button
+                          onClick={() => skipTrack(track)}
+                          title="Skip — hide this track without moving your mood"
+                          style={{
+                            width: '32px', height: '32px',
+                            borderRadius: '50%',
+                            border: `1px solid ${colors.cardBorder}`,
+                            background: 'rgba(120,120,120,0.08)',
+                            color: colors.textMuted,
+                            cursor: 'pointer',
+                            fontSize: '0.85rem',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}
+                        >⊘</button>
                       </div>
                     </div>
                   );
