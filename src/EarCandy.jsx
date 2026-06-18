@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { quantizePitchData, noteSequenceToString } from './utils/melodyQuantizer';
-import { matchMelody, MIN_DISTINCT_NOTES } from './utils/matchingEngine';
+import { matchMelody, getThresholdsForDB } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
 import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetection';
 import { recognizeWithAudD, shouldUseFallback, isSandboxToken } from './utils/auddFallback';
@@ -51,20 +51,24 @@ const globalGenres = [
   { id: 'american_rock', name: 'American Rock', region: 'USA', color: '#636e72' },
 ];
 
-// Sample recommendation database (in production, this would be much larger)
+// Sample recommendation database (in production, this would be much larger).
+// Each track is placed in Russell's circumplex (valence × energy, both 0..1) so
+// the scorer can compute proximity rather than just match a mood label.
+//   valence: 0 = sad/negative, 1 = happy/positive
+//   energy:  0 = calm/low-arousal, 1 = intense/high-arousal
 const sampleTracks = [
-  { id: 1, title: 'Thillana in Dhanashree', artist: 'Balamuralikrishna', genre: 'carnatic', bpm: 120, key: 'D', mood: 'energetic' },
-  { id: 2, title: 'Raag Yaman Alap', artist: 'Hariprasad Chaurasia', genre: 'hindustani', bpm: 60, key: 'E', mood: 'calm' },
-  { id: 3, title: 'Children of Bodom', artist: 'Hate Crew Deathroll', genre: 'finnish_metal', bpm: 180, key: 'Em', mood: 'energetic' },
-  { id: 4, title: 'Despacito', artist: 'Luis Fonsi', genre: 'reggaeton', bpm: 89, key: 'Bm', mood: 'happy' },
-  { id: 5, title: 'Oh Happy Day', artist: 'Edwin Hawkins', genre: 'gospel', bpm: 115, key: 'F', mood: 'happy' },
-  { id: 6, title: 'Dynamite', artist: 'BTS', genre: 'kpop', bpm: 114, key: 'C#m', mood: 'energetic' },
-  { id: 7, title: 'Water No Get Enemy', artist: 'Fela Kuti', genre: 'afrobeat', bpm: 105, key: 'Em', mood: 'energetic' },
-  { id: 8, title: 'The Girl from Ipanema', artist: 'João Gilberto', genre: 'bossa_nova', bpm: 72, key: 'F', mood: 'calm' },
-  { id: 9, title: 'Entre dos Aguas', artist: 'Paco de Lucía', genre: 'flamenco', bpm: 95, key: 'Am', mood: 'romantic' },
-  { id: 10, title: 'First Love', artist: 'Hikaru Utada', genre: 'jpop', bpm: 78, key: 'Db', mood: 'melancholic' },
-  { id: 11, title: 'Tumhe Dillagi', artist: 'Nusrat Fateh Ali Khan', genre: 'qawwali', bpm: 85, key: 'Gm', mood: 'romantic' },
-  { id: 12, title: 'Hotel California', artist: 'Eagles', genre: 'american_rock', bpm: 75, key: 'Bm', mood: 'melancholic' },
+  { id: 1, title: 'Thillana in Dhanashree', artist: 'Balamuralikrishna', genre: 'carnatic', bpm: 120, key: 'D', mood: 'energetic', valence: 0.75, energy: 0.85 },
+  { id: 2, title: 'Raag Yaman Alap', artist: 'Hariprasad Chaurasia', genre: 'hindustani', bpm: 60, key: 'E', mood: 'calm', valence: 0.55, energy: 0.20 },
+  { id: 3, title: 'Children of Bodom', artist: 'Hate Crew Deathroll', genre: 'finnish_metal', bpm: 180, key: 'Em', mood: 'energetic', valence: 0.45, energy: 0.98 },
+  { id: 4, title: 'Despacito', artist: 'Luis Fonsi', genre: 'reggaeton', bpm: 89, key: 'Bm', mood: 'happy', valence: 0.85, energy: 0.75 },
+  { id: 5, title: 'Oh Happy Day', artist: 'Edwin Hawkins', genre: 'gospel', bpm: 115, key: 'F', mood: 'happy', valence: 0.95, energy: 0.70 },
+  { id: 6, title: 'Dynamite', artist: 'BTS', genre: 'kpop', bpm: 114, key: 'C#m', mood: 'energetic', valence: 0.90, energy: 0.85 },
+  { id: 7, title: 'Water No Get Enemy', artist: 'Fela Kuti', genre: 'afrobeat', bpm: 105, key: 'Em', mood: 'energetic', valence: 0.75, energy: 0.70 },
+  { id: 8, title: 'The Girl from Ipanema', artist: 'João Gilberto', genre: 'bossa_nova', bpm: 72, key: 'F', mood: 'calm', valence: 0.70, energy: 0.30 },
+  { id: 9, title: 'Entre dos Aguas', artist: 'Paco de Lucía', genre: 'flamenco', bpm: 95, key: 'Am', mood: 'romantic', valence: 0.65, energy: 0.50 },
+  { id: 10, title: 'First Love', artist: 'Hikaru Utada', genre: 'jpop', bpm: 78, key: 'Db', mood: 'melancholic', valence: 0.30, energy: 0.35 },
+  { id: 11, title: 'Tumhe Dillagi', artist: 'Nusrat Fateh Ali Khan', genre: 'qawwali', bpm: 85, key: 'Gm', mood: 'romantic', valence: 0.60, energy: 0.45 },
+  { id: 12, title: 'Hotel California', artist: 'Eagles', genre: 'american_rock', bpm: 75, key: 'Bm', mood: 'melancholic', valence: 0.40, energy: 0.45 },
 ];
 
 // Audio analysis utilities (the "physics layer" — autocorrelation pitch detection,
@@ -335,8 +339,12 @@ export default function EarCandy() {
     console.log('✅ Analysis complete:', features);
     setDetectedFeatures(features);
     
-    // Quantize pitch data into discrete notes
-    const notes = quantizePitchData(collectedPitchData, { windowMs: 150, minNoteDurationMs: 80 });
+    // Quantize pitch data into discrete notes. Thresholds auto-tune to the
+    // active database: smaller DB -> longer min duration to suppress blips;
+    // bigger DB -> shorter min duration to preserve discriminating detail.
+    const { minNoteDurationMs, mode } = getThresholdsForDB(songDatabase);
+    console.log(`⚙️  DB mode: ${mode} (${songDatabase.length} songs, ${minNoteDurationMs}ms min note)`);
+    const notes = quantizePitchData(collectedPitchData, { windowMs: 150, minNoteDurationMs });
     console.log('📝 Quantized notes:', notes.map(n => n.note + n.octave));
     setQuantizedNotes(notes);
     
@@ -351,9 +359,10 @@ export default function EarCandy() {
     const distinctNotes = (quantizedNotes || []).filter(
       (n, i, arr) => i === 0 || `${n.note}${n.octave}` !== `${arr[i - 1].note}${arr[i - 1].octave}`
     ).length;
-    if (distinctNotes < MIN_DISTINCT_NOTES) {
-      console.warn(`⚠️ Need at least ${MIN_DISTINCT_NOTES} distinct notes (got ${distinctNotes})`);
-      alert(`Please hum a longer phrase — at least ${MIN_DISTINCT_NOTES} distinct notes. Short hums match too many songs to identify reliably.`);
+    const { minDistinctNotes } = getThresholdsForDB(songDatabase);
+    if (distinctNotes < minDistinctNotes) {
+      console.warn(`⚠️ Need at least ${minDistinctNotes} distinct notes (got ${distinctNotes})`);
+      alert(`Please hum a longer phrase — at least ${minDistinctNotes} distinct notes. Short hums match too many songs to identify reliably.`);
       return;
     }
 
@@ -396,37 +405,75 @@ export default function EarCandy() {
     }
   }, [quantizedNotes, audioBlob]);
 
-  // Generate recommendations based on analysis and mood
+  // Generate recommendations using affect-space proximity (Russell's circumplex).
+  // Each track lives at a (valence, energy) point in the unit square. The selected
+  // mood also lives at a point. Score = how close the track is to that point,
+  // weighted against genre diversity and a small randomness term for variety.
   const generateRecommendations = useCallback(() => {
     if (!selectedMood) return;
 
-    // Score each track based purely on mood
+    const targetMood = moods.find(m => m.id === selectedMood);
+    if (!targetMood) return;
+    const { valence: tv, energy: te } = targetMood;
+
+    // Euclidean distance in (valence, energy) space, normalized to 0..1.
+    // sqrt(2) is the max possible distance (corner-to-corner of the unit square).
+    const SQRT2 = Math.SQRT2;
+
     const scored = sampleTracks.map(track => {
-      let score = 0;
+      const dv = track.valence - tv;
+      const den = track.energy - te;
+      const distance = Math.sqrt(dv * dv + den * den);  // 0 (perfect) .. sqrt(2) (worst)
+      const proximity = 1 - distance / SQRT2;            // 1 (perfect) .. 0 (worst)
 
-      if (track.mood === selectedMood) score += 50;
+      // Components (each contributes to a 0..100 final score):
+      //   proximity:  70 — how close the track sits to the requested mood
+      //   labelMatch: 15 — small bonus if the track's named mood matches exactly
+      //   variety:    15 — randomness so identical-score tracks don't always tie the same way
+      const proximityScore = proximity * 70;
+      const labelMatch = track.mood === selectedMood ? 15 : 0;
+      const variety = Math.random() * 15;
 
-      // Add some randomness for variety
-      score += Math.random() * 20;
+      const score = proximityScore + labelMatch + variety;
 
-      return { ...track, score };
+      // Build a human-readable explanation of why this track surfaced.
+      const reasons = [];
+      if (proximity > 0.85) reasons.push('strong mood fit');
+      else if (proximity > 0.65) reasons.push('close to your mood');
+      else reasons.push('related mood');
+      if (labelMatch) reasons.push(`tagged ${targetMood.label.toLowerCase()}`);
+      if (track.valence > tv + 0.15) reasons.push('a bit brighter');
+      else if (track.valence < tv - 0.15) reasons.push('a bit darker');
+      if (track.energy > te + 0.15) reasons.push('higher energy');
+      else if (track.energy < te - 0.15) reasons.push('lower energy');
+
+      return {
+        ...track,
+        score,
+        distance,
+        proximity,
+        reason: reasons.join(' • '),
+      };
     });
-    
-    // Sort by score and take top results, ensuring genre diversity
+
+    // Rank by score, then pick 6 with light genre diversity (no more than 2 per genre
+    // until we've drawn from at least 4 different genres).
     scored.sort((a, b) => b.score - a.score);
-    
-    // Select diverse recommendations
     const selected = [];
-    const usedGenres = new Set();
-    
+    const genreCounts = new Map();
     for (const track of scored) {
       if (selected.length >= 6) break;
-      if (!usedGenres.has(track.genre) || selected.length >= 4) {
+      const count = genreCounts.get(track.genre) || 0;
+      const enoughDiversity = genreCounts.size >= 4;
+      if (count < 2 || enoughDiversity) {
         selected.push(track);
-        usedGenres.add(track.genre);
+        genreCounts.set(track.genre, count + 1);
       }
     }
-    
+
+    console.log(`💭 Mood: ${targetMood.label} (v=${tv}, e=${te})`);
+    console.log('🎶 Recommendations:', selected.map(t => `${t.title} [prox=${t.proximity.toFixed(2)}, score=${t.score.toFixed(1)}]`));
+
     setRecommendations(selected);
     setActiveTab('results');
   }, [selectedMood]);
@@ -1252,8 +1299,8 @@ export default function EarCandy() {
                       
                       {/* Track info */}
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ 
-                          fontWeight: 600, 
+                        <div style={{
+                          fontWeight: 600,
                           marginBottom: '4px',
                           whiteSpace: 'nowrap',
                           overflow: 'hidden',
@@ -1261,8 +1308,8 @@ export default function EarCandy() {
                         }}>
                           {track.title}
                         </div>
-                        <div style={{ 
-                          color: colors.textMuted, 
+                        <div style={{
+                          color: colors.textMuted,
                           fontSize: '0.85rem',
                           whiteSpace: 'nowrap',
                           overflow: 'hidden',
@@ -1270,6 +1317,19 @@ export default function EarCandy() {
                         }}>
                           {track.artist}
                         </div>
+                        {track.reason && (
+                          <div style={{
+                            color: colors.purple,
+                            fontSize: '0.72rem',
+                            marginTop: '4px',
+                            fontStyle: 'italic',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis'
+                          }}>
+                            {track.reason}
+                          </div>
+                        )}
                       </div>
                       
                       {/* Genre tag */}
