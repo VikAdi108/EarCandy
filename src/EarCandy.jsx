@@ -4,6 +4,7 @@ import { matchMelody, getThresholdsForDB } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
 import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetection';
 import { recognizeWithAudD, shouldUseFallback, isSandboxToken } from './utils/auddFallback';
+import { tracksDatabase as sampleTracks } from './utils/tracksDatabase';
 import HowItWorks from './components/HowItWorks';
 
 // ============================================
@@ -78,25 +79,11 @@ const globalGenres = [
   { id: 'american_rock', name: 'American Rock', region: 'USA', color: '#636e72' },
 ];
 
-// Sample recommendation database (in production, this would be much larger).
-// Each track is placed in Russell's circumplex (valence × energy, both 0..1) so
-// the scorer can compute proximity rather than just match a mood label.
-//   valence: 0 = sad/negative, 1 = happy/positive
-//   energy:  0 = calm/low-arousal, 1 = intense/high-arousal
-const sampleTracks = [
-  { id: 1, title: 'Thillana in Dhanashree', artist: 'Balamuralikrishna', genre: 'carnatic', bpm: 120, key: 'D', mood: 'energetic', valence: 0.75, energy: 0.85 },
-  { id: 2, title: 'Raag Yaman Alap', artist: 'Hariprasad Chaurasia', genre: 'hindustani', bpm: 60, key: 'E', mood: 'calm', valence: 0.55, energy: 0.20 },
-  { id: 3, title: 'Children of Bodom', artist: 'Hate Crew Deathroll', genre: 'finnish_metal', bpm: 180, key: 'Em', mood: 'energetic', valence: 0.45, energy: 0.98 },
-  { id: 4, title: 'Despacito', artist: 'Luis Fonsi', genre: 'reggaeton', bpm: 89, key: 'Bm', mood: 'happy', valence: 0.85, energy: 0.75 },
-  { id: 5, title: 'Oh Happy Day', artist: 'Edwin Hawkins', genre: 'gospel', bpm: 115, key: 'F', mood: 'happy', valence: 0.95, energy: 0.70 },
-  { id: 6, title: 'Dynamite', artist: 'BTS', genre: 'kpop', bpm: 114, key: 'C#m', mood: 'energetic', valence: 0.90, energy: 0.85 },
-  { id: 7, title: 'Water No Get Enemy', artist: 'Fela Kuti', genre: 'afrobeat', bpm: 105, key: 'Em', mood: 'energetic', valence: 0.75, energy: 0.70 },
-  { id: 8, title: 'The Girl from Ipanema', artist: 'João Gilberto', genre: 'bossa_nova', bpm: 72, key: 'F', mood: 'calm', valence: 0.70, energy: 0.30 },
-  { id: 9, title: 'Entre dos Aguas', artist: 'Paco de Lucía', genre: 'flamenco', bpm: 95, key: 'Am', mood: 'romantic', valence: 0.65, energy: 0.50 },
-  { id: 10, title: 'First Love', artist: 'Hikaru Utada', genre: 'jpop', bpm: 78, key: 'Db', mood: 'melancholic', valence: 0.30, energy: 0.35 },
-  { id: 11, title: 'Tumhe Dillagi', artist: 'Nusrat Fateh Ali Khan', genre: 'qawwali', bpm: 85, key: 'Gm', mood: 'romantic', valence: 0.60, energy: 0.45 },
-  { id: 12, title: 'Hotel California', artist: 'Eagles', genre: 'american_rock', bpm: 75, key: 'Bm', mood: 'melancholic', valence: 0.40, energy: 0.45 },
-];
+// Track pool now lives in ./utils/tracksDatabase.js (curated 100-track baseline,
+// each placed in Russell's circumplex with hand-set valence/energy). Imported
+// as `sampleTracks` at the top of this file. Stage 3b will add a Spotify-features
+// layer on top while keeping our 12 regional categories alive (see
+// memory/earcandy_genre_taxonomy.md).
 
 // Audio analysis utilities (the "physics layer" — autocorrelation pitch detection,
 // frequency->note conversion, RMS loudness) live in ./utils/pitchDetection and are
