@@ -6,6 +6,7 @@ import { detectPitch, frequencyToNote, calculateRMS } from './utils/pitchDetecti
 import { recognizeWithAudD, shouldUseFallback, isSandboxToken } from './utils/auddFallback';
 import { tracksDatabase } from './utils/tracksDatabase';
 import { spotifyTracks } from './utils/spotifyTracks';
+import { findPreview } from './utils/previewLookup';
 
 // Stage 3b merge: curated 100-track baseline + Spotify-derived pool.
 // The curated tracks come first so their hand-tagged metadata (regional
@@ -224,6 +225,12 @@ export default function EarCandy() {
   // Tracks the user has marked "less like this" / "skip" — excluded from future
   // picks until reset. Set, not array, for O(1) membership checks in the scorer.
   const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
+  // Stage 3d audio preview state. We share ONE <audio> element across all cards
+  // so playing a new track auto-stops whatever was playing before.
+  const audioRef = useRef(null);
+  const [playingTrackId, setPlayingTrackId] = useState(null);
+  const [loadingPreviewId, setLoadingPreviewId] = useState(null);
+  const [unavailablePreviewIds, setUnavailablePreviewIds] = useState(() => new Set());
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [activeTab, setActiveTab] = useState('record'); // record, mood, results, recognition
   const [detectedFeatures, setDetectedFeatures] = useState(null);
@@ -689,6 +696,68 @@ export default function EarCandy() {
   }, []);
 
   const clearSkipped = useCallback(() => setSkippedTrackIds(new Set()), []);
+
+  // ─── Audio preview (Stage 3d) ────────────────────────────────────────────
+  //
+  // togglePreview is the single handler for the play/pause button on each card.
+  // Behaviour:
+  //   - Click on the currently-playing track → pause it
+  //   - Click on any other track → stop the old one, fetch (if needed), play
+  //   - Tracks not on iTunes get added to unavailablePreviewIds; their button
+  //     greys out and shows "unavailable" instead of triggering another fetch.
+  // Uses ONE shared <audio> element (audioRef) so we never get overlapping clips.
+  const togglePreview = useCallback(async (track) => {
+    // Lazy-create the audio element on first use so SSR/test environments don't
+    // need an Audio constructor up front.
+    if (!audioRef.current) {
+      audioRef.current = new Audio();
+      audioRef.current.addEventListener('ended', () => setPlayingTrackId(null));
+    }
+    const audio = audioRef.current;
+
+    // Pause toggle on the active track
+    if (playingTrackId === track.id) {
+      audio.pause();
+      setPlayingTrackId(null);
+      return;
+    }
+
+    // Stop whatever else is playing
+    audio.pause();
+    setPlayingTrackId(null);
+
+    if (unavailablePreviewIds.has(track.id)) return;
+
+    setLoadingPreviewId(track.id);
+    const result = await findPreview(track.artist, track.title);
+    setLoadingPreviewId(null);
+
+    if (!result || !result.url) {
+      setUnavailablePreviewIds(prev => new Set(prev).add(track.id));
+      return;
+    }
+
+    audio.src = result.url;
+    try {
+      await audio.play();
+      setPlayingTrackId(track.id);
+    } catch {
+      // Autoplay blocked or codec issue — treat as unavailable
+      setUnavailablePreviewIds(prev => new Set(prev).add(track.id));
+    }
+  }, [playingTrackId, unavailablePreviewIds]);
+
+  // Stop preview when leaving the results tab or unmounting, so audio never
+  // keeps playing in the background after the user has moved on.
+  useEffect(() => {
+    if (activeTab !== 'results' && audioRef.current) {
+      audioRef.current.pause();
+      setPlayingTrackId(null);
+    }
+  }, [activeTab]);
+  useEffect(() => () => {
+    if (audioRef.current) audioRef.current.pause();
+  }, []);
 
   // Auto-regenerate when the marker moves OR the skip set changes — but ONLY
   // if the user is already on the results tab (i.e. they've already discovered
@@ -1830,6 +1899,42 @@ export default function EarCandy() {
                       }}>
                         {track.bpm} BPM
                       </div>
+
+                      {/* Audio preview (Stage 3d) — fetches a 30-second clip
+                          from iTunes lazily on first click; subsequent clicks
+                          replay from cache. Loading and unavailable states are
+                          surfaced inline. */}
+                      <button
+                        onClick={() => togglePreview(track)}
+                        disabled={unavailablePreviewIds.has(track.id) || loadingPreviewId === track.id}
+                        title={
+                          unavailablePreviewIds.has(track.id) ? 'No preview available on iTunes' :
+                          loadingPreviewId === track.id ? 'Loading preview…' :
+                          playingTrackId === track.id ? 'Pause preview' : 'Play 30-second preview'
+                        }
+                        style={{
+                          width: '40px', height: '40px',
+                          borderRadius: '50%',
+                          border: `1px solid ${colors.cardBorder}`,
+                          background:
+                            unavailablePreviewIds.has(track.id) ? 'rgba(120,120,120,0.06)'
+                            : playingTrackId === track.id ? `${colors.primary}30`
+                            : `${colors.accent}15`,
+                          color:
+                            unavailablePreviewIds.has(track.id) ? colors.textMuted
+                            : playingTrackId === track.id ? colors.primary
+                            : colors.accent,
+                          cursor: unavailablePreviewIds.has(track.id) ? 'not-allowed' : 'pointer',
+                          fontSize: '1rem',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          marginLeft: '8px',
+                          opacity: unavailablePreviewIds.has(track.id) ? 0.4 : 1,
+                        }}
+                      >
+                        {loadingPreviewId === track.id ? '⏳' :
+                         unavailablePreviewIds.has(track.id) ? '∅' :
+                         playingTrackId === track.id ? '⏸' : '▶'}
+                      </button>
 
                       {/* Refinement controls (Stage 3c) — three small icon
                           buttons. Hovering each one explains what it does. */}
