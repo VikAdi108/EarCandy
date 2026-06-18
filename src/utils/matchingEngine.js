@@ -13,11 +13,38 @@ const INTERVAL_ERROR_SCALE = 1.5;
 // = coverage matters more. 0.4 means a fragment match keeps at most 40% of its score.
 const COVERAGE_FLOOR = 0.4;
 
-// Minimum distinct notes required to attempt a confident match.
-// Demo-mode (83-song handcrafted DB): lowered to 4 so short songs like Happy
-// Birthday (5 distinct notes) and Twinkle Twinkle short (3 distinct) can match.
-// In full-DB mode, raise back to 6 to reduce collisions across 8k+ songs.
+// Default minimum distinct notes when no DB context is given.
+// Prefer getThresholdsForDB(songDatabase) which auto-tunes per DB size.
 const MIN_DISTINCT_NOTES = 4;
+
+// Crossover point between "small demo DB" and "large full DB" tunings.
+// Below this, the matcher gets fewer collisions per pattern and can be lenient;
+// above this, interval patterns collide across many songs and we need stricter
+// gating to avoid noise in the top results.
+const LARGE_DB_THRESHOLD = 1000;
+
+/**
+ * Pick quantizer/matcher thresholds based on database size.
+ *
+ * Small DB (< LARGE_DB_THRESHOLD songs, e.g. 81-song demo):
+ *   - 180ms min note duration  → cleaner contour by dropping transition blips
+ *   - 4 distinct notes minimum → short iconic melodies (Happy Birthday) pass
+ *
+ * Large DB (>= LARGE_DB_THRESHOLD songs, e.g. 9,213-song full):
+ *   - 80ms min note duration   → keep fast passing notes for discrimination
+ *   - 6 distinct notes minimum → reject short hums that match too many songs
+ *
+ * Centralised here so swapping songDatabase.js auto-adjusts everything; the
+ * two thresholds always travel together as a pair.
+ */
+export function getThresholdsForDB(songDatabase) {
+  const isLargeDB = (songDatabase?.length || 0) >= LARGE_DB_THRESHOLD;
+  return {
+    minNoteDurationMs: isLargeDB ? 80 : 180,
+    minDistinctNotes: isLargeDB ? 6 : 4,
+    mode: isLargeDB ? 'full' : 'demo',
+  };
+}
 
 /**
  * Dynamic Time Warping Distance
