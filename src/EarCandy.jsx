@@ -225,6 +225,10 @@ export default function EarCandy() {
   // Tracks the user has marked "less like this" / "skip" — excluded from future
   // picks until reset. Set, not array, for O(1) membership checks in the scorer.
   const [skippedTrackIds, setSkippedTrackIds] = useState(() => new Set());
+  // Stage 3e: tracks the user has "liked" (expanded). A like keeps the song in
+  // place and inserts a derived cluster right after it, so we remember which
+  // seeds are already expanded to render a filled heart and avoid re-inserting.
+  const [likedTrackIds, setLikedTrackIds] = useState(() => new Set());
   // Stage 3d audio preview state. We share ONE <audio> element across all cards
   // so playing a new track auto-stops whatever was playing before.
   const audioRef = useRef(null);
@@ -662,38 +666,79 @@ export default function EarCandy() {
 
     console.log('🎶 Recommendations:', selected.map(t => `${t.title} [prox=${t.proximity.toFixed(2)}]`));
     setRecommendations(selected);
+    // A freshly-seeded playlist starts with no likes/expansions.
+    setLikedTrackIds(new Set());
     setActiveTab('results');
   }, [moodPosition, desiredMood, useJourney, skippedTrackIds, scoreTrackAgainstTarget]);
 
-  // ─── Refinement controls (Stage 3c) ──────────────────────────────────────
+  // ─── Refinement controls (Stage 3e — like-adjusted playlist expansion) ────
   //
-  // "More like this" pulls the marker 30% of the way toward the track's
-  //   position in (valence, energy) space — partial nudge so a single click
-  //   doesn't overshoot, and repeated clicks converge.
-  // "Less like this" pushes the marker 20% in the opposite direction AND adds
-  //   the track to the skip set so it can't resurface.
-  // "Skip" just adds to the skip set without nudging the marker (useful when
-  //   the marker is right but this specific track isn't).
-  // After any of these, recommendations are regenerated automatically so the
-  //   user sees the effect immediately.
-  const nudgeMarkerToward = useCallback((track) => {
-    setMoodPosition(prev => ({
-      valence: Math.max(0, Math.min(1, prev.valence + (track.valence - prev.valence) * 0.30)),
-      energy:  Math.max(0, Math.min(1, prev.energy  + (track.energy  - prev.energy)  * 0.30)),
-    }));
+  // The playlist is now a living, directly-edited list rather than a throwaway
+  // derived from the marker. The marker only *seeds* the initial 6 (via
+  // Discover / deliberate mood moves); from there the user sculpts in place:
+  //
+  // "Like" (❤)        — keeps the song exactly where it is and INSERTS a
+  //   curated cluster of CLUSTER_SIZE songs derived from it, right after it.
+  //   So 1 2 3 [4] 5 6  →  1 2 3 [4] 4A 4B 4C 4D 4E 4F 5 6. Works on any song,
+  //   including inserted ones (clusters can nest). Idempotent: re-liking a seed
+  //   whose cluster is still present does nothing.
+  // "Less like this" (⊘) — removes the track AND skip-sets it so it can never
+  //   resurface in a future cluster this session (strong, sticky exclusion).
+  // "Skip" (👎)       — removes the track from the current playlist only
+  //   (lighter: it may resurface if a nearby seed is later expanded).
+  const CLUSTER_SIZE = 6;
+  // A like means "more like *this* song", a tighter promise than the genre-
+  // agnostic main playlist. So the cluster sorts by mood proximity PLUS a modest
+  // same-genre bonus: it leads with the liked song's genre (e.g. bossa nova for
+  // Wave) while still letting strongly mood-matched cross-genre tracks in. Sized
+  // in proximity units (0–1); ~0.06 ≈ outranking a track a few % further away.
+  const GENRE_AFFINITY = 0.06;
+
+  const expandFromTrack = useCallback((seed) => {
+    setRecommendations(prev => {
+      const idx = prev.findIndex(t => t.id === seed.id);
+      if (idx === -1) return prev;
+      // Already expanded and its cluster is still present → no-op (idempotent).
+      if (prev.some(t => t.derivedFrom === seed.id)) return prev;
+
+      const presentIds = new Set(prev.map(t => t.id));
+      const matched = nearestNamedMood(seed.valence, seed.energy);
+      const namedMatchId = matched.distance < 0.12 ? matched.mood.id : null;
+      const affinity = t => t.proximity + (t.genre === seed.genre ? GENRE_AFFINITY : 0);
+
+      const cluster = sampleTracks
+        .filter(t => t.id !== seed.id && !presentIds.has(t.id) && !skippedTrackIds.has(t.id))
+        .map(t => scoreTrackAgainstTarget(t, seed.valence, seed.energy, namedMatchId))
+        .sort((a, b) => affinity(b) - affinity(a))
+        .slice(0, CLUSTER_SIZE)
+        .map(t => ({
+          ...t,
+          derivedFrom: seed.id,
+          derivedFromTitle: seed.title,
+          depth: (seed.depth || 0) + 1,
+        }));
+      if (cluster.length === 0) return prev;
+
+      const next = [...prev];
+      next.splice(idx + 1, 0, ...cluster);
+      return next;
+    });
+    setLikedTrackIds(prev => new Set(prev).add(seed.id));
+  }, [skippedTrackIds, scoreTrackAgainstTarget]);
+
+  // Remove a single track from the playlist in place (a splice, not a regen).
+  // `sticky` also adds it to the skip set so it won't reappear in any cluster.
+  const removeTrack = useCallback((track, { sticky }) => {
+    setRecommendations(prev => prev.filter(t => t.id !== track.id));
+    if (sticky) setSkippedTrackIds(prev => new Set(prev).add(track.id));
+    setLikedTrackIds(prev => {
+      if (!prev.has(track.id)) return prev;
+      const next = new Set(prev); next.delete(track.id); return next;
+    });
   }, []);
 
-  const nudgeMarkerAway = useCallback((track) => {
-    setMoodPosition(prev => ({
-      valence: Math.max(0, Math.min(1, prev.valence + (prev.valence - track.valence) * 0.20)),
-      energy:  Math.max(0, Math.min(1, prev.energy  + (prev.energy  - track.energy)  * 0.20)),
-    }));
-    setSkippedTrackIds(prev => new Set(prev).add(track.id));
-  }, []);
-
-  const skipTrack = useCallback((track) => {
-    setSkippedTrackIds(prev => new Set(prev).add(track.id));
-  }, []);
+  const lessLikeThis = useCallback((track) => removeTrack(track, { sticky: true }), [removeTrack]);
+  const skipTrack    = useCallback((track) => removeTrack(track, { sticky: false }), [removeTrack]);
 
   const clearSkipped = useCallback(() => setSkippedTrackIds(new Set()), []);
 
@@ -759,15 +804,15 @@ export default function EarCandy() {
     if (audioRef.current) audioRef.current.pause();
   }, []);
 
-  // Auto-regenerate when the marker moves OR the skip set changes — but ONLY
-  // if the user is already on the results tab (i.e. they've already discovered
-  // once). This way nudge buttons feel instantaneous; first-time discover still
-  // requires the explicit "Discover" click.
+  // Re-seed the playlist only on a *deliberate* mood change (marker drag, preset,
+  // journey toggle) while already on the results tab. Stage 3e makes the playlist
+  // a hand-sculpted structure, so like/dislike edit it in place and must NOT
+  // trigger a full re-roll — hence skippedTrackIds is intentionally NOT a dep.
   useEffect(() => {
     if (activeTab !== 'results') return;
     generateRecommendations();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [moodPosition, desiredMood, skippedTrackIds]);
+  }, [moodPosition, desiredMood]);
 
   // While a marker is being dragged, listen to window-level pointer events so
   // the drag keeps working even if the cursor briefly leaves the grid bounds.
@@ -806,6 +851,7 @@ export default function EarCandy() {
     setRecommendations([]);
     setUseJourney(false);
     setSkippedTrackIds(new Set());
+    setLikedTrackIds(new Set());
     setAnalysisComplete(false);
     setDetectedFeatures(null);
     setQuantizedNotes(null);
@@ -1780,6 +1826,13 @@ export default function EarCandy() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 {recommendations.map((track, i) => {
                   const genre = globalGenres.find(g => g.id === track.genre);
+                  // Stage 3e: tracks inserted by a "like" are indented and carry a
+                  // left accent in their genre colour, so a cluster visibly flows
+                  // from the song it was derived from. Depth lets nested clusters
+                  // step in further.
+                  const isDerived = !!track.derivedFrom;
+                  const isLiked = likedTrackIds.has(track.id);
+                  const accent = genre?.color || colors.primary;
                   return (
                     <div
                       key={track.id}
@@ -1787,8 +1840,10 @@ export default function EarCandy() {
                         display: 'flex',
                         alignItems: 'center',
                         padding: '15px 20px',
+                        marginLeft: isDerived ? `${Math.min(track.depth || 1, 3) * 22}px` : 0,
                         background: 'rgba(0,0,0,0.3)',
                         borderRadius: '12px',
+                        borderLeft: isDerived ? `3px solid ${accent}` : '3px solid transparent',
                         gap: '15px',
                         animation: 'slideUp 0.5s ease',
                         animationDelay: `${i * 0.1}s`,
@@ -1839,6 +1894,21 @@ export default function EarCandy() {
                       
                       {/* Track info */}
                       <div style={{ flex: 1, minWidth: 0 }}>
+                        {/* Lineage caption — only on derived tracks, so the
+                            cluster reads as "more like <the liked song>". */}
+                        {isDerived && (
+                          <div style={{
+                            color: accent,
+                            fontSize: '0.68rem',
+                            fontWeight: 600,
+                            marginBottom: '2px',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis'
+                          }}>
+                            ↳ more like ❤ {track.derivedFromTitle}
+                          </div>
+                        )}
                         <div style={{
                           fontWeight: 600,
                           marginBottom: '4px',
@@ -1936,26 +2006,29 @@ export default function EarCandy() {
                          playingTrackId === track.id ? '⏸' : '▶'}
                       </button>
 
-                      {/* Refinement controls (Stage 3c) — three small icon
-                          buttons. Hovering each one explains what it does. */}
+                      {/* Refinement controls (Stage 3e) — three small icon
+                          buttons. ❤ keeps the song and inserts a cluster below
+                          it; ⊘ removes + permanently mutes; 👎 just removes. */}
                       <div style={{ display: 'flex', gap: '6px', marginLeft: '6px' }}>
                         <button
-                          onClick={() => nudgeMarkerToward(track)}
-                          title="More like this — pull mood toward this track"
+                          onClick={() => expandFromTrack(track)}
+                          title={isLiked
+                            ? 'Liked — a cluster of similar songs was added below'
+                            : 'Like — keep this song and add more like it right below'}
                           style={{
                             width: '32px', height: '32px',
                             borderRadius: '50%',
-                            border: `1px solid ${colors.cardBorder}`,
-                            background: 'rgba(255,107,107,0.08)',
-                            color: colors.primary,
+                            border: `1px solid ${isLiked ? colors.primary : colors.cardBorder}`,
+                            background: isLiked ? colors.primary : 'rgba(255,107,107,0.08)',
+                            color: isLiked ? 'white' : colors.primary,
                             cursor: 'pointer',
                             fontSize: '0.85rem',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                           }}
                         >❤</button>
                         <button
-                          onClick={() => nudgeMarkerAway(track)}
-                          title="Less like this — push mood away and hide this track"
+                          onClick={() => lessLikeThis(track)}
+                          title="Less like this — remove it and stop suggesting it"
                           style={{
                             width: '32px', height: '32px',
                             borderRadius: '50%',
@@ -1969,7 +2042,7 @@ export default function EarCandy() {
                         >⊘</button>
                         <button
                           onClick={() => skipTrack(track)}
-                          title="Skip — hide this track without moving your mood"
+                          title="Skip — remove this track from the playlist"
                           style={{
                             width: '32px', height: '32px',
                             borderRadius: '50%',
