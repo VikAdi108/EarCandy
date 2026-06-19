@@ -1966,7 +1966,7 @@ export default function EarCandy() {
                             fontSize: '0.85rem',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                           }}
-                        >👎</button>
+                        >⊘</button>
                         <button
                           onClick={() => skipTrack(track)}
                           title="Skip — hide this track without moving your mood"
@@ -1980,7 +1980,7 @@ export default function EarCandy() {
                             fontSize: '0.85rem',
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                           }}
-                        >⊘</button>
+                        >👎</button>
                       </div>
                     </div>
                   );
