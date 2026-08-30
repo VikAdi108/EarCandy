@@ -15,6 +15,7 @@ import { findPreview } from './utils/previewLookup';
 // Spotify-origin tracks carry source: 'spotify' for UI/debug purposes.
 const sampleTracks = [...tracksDatabase, ...spotifyTracks];
 import HowItWorks from './components/HowItWorks';
+import AffectSpaceExplorer from './components/AffectSpaceExplorer';
 
 // ============================================
 // EARCANDY - Music Recognition & Recommendation
@@ -1001,12 +1002,13 @@ export default function EarCandy() {
             { id: 'recognition', label: '2. Recognize', icon: '🔍' },
             { id: 'mood', label: '3. Mood', icon: '💭' },
             { id: 'results', label: '4. Discover', icon: '🌍' },
+            { id: 'affectspace', label: 'Affect Space', icon: '🎯' },
             { id: 'howitworks', label: 'How it works', icon: '🔬' }
           ].map((tab, i) => (
             <button
               key={tab.id}
               onClick={() => {
-                if (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || tab.id === 'mood' || (tab.id === 'results' && recommendations.length > 0) || tab.id === 'howitworks') {
+                if (tab.id === 'record' || (tab.id === 'recognition' && analysisComplete) || tab.id === 'mood' || (tab.id === 'results' && recommendations.length > 0) || tab.id === 'howitworks' || tab.id === 'affectspace') {
                   setActiveTab(tab.id);
                 }
               }}
@@ -1020,8 +1022,8 @@ export default function EarCandy() {
                 color: activeTab === tab.id ? colors.text : colors.textMuted,
                 fontSize: '0.9rem',
                 fontWeight: 500,
-                cursor: (tab.id === 'record' || tab.id === 'howitworks' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
-                opacity: (tab.id === 'record' || tab.id === 'howitworks' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
+                cursor: (tab.id === 'record' || tab.id === 'howitworks' || tab.id === 'affectspace' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 'pointer' : 'not-allowed',
+                opacity: (tab.id === 'record' || tab.id === 'howitworks' || tab.id === 'affectspace' || (tab.id === 'recognition' && analysisComplete) || (tab.id === 'mood' && analysisComplete) || (tab.id === 'results' && recommendations.length > 0)) ? 1 : 0.5,
                 transition: 'all 0.3s ease',
                 fontFamily: 'inherit'
               }}
@@ -1220,6 +1222,10 @@ export default function EarCandy() {
         )}
 
         {/* How It Works Tab */}
+        {activeTab === 'affectspace' && (
+          <AffectSpaceExplorer colors={colors} />
+        )}
+
         {activeTab === 'howitworks' && (
           <HowItWorks colors={colors} />
         )}
