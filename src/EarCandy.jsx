@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { quantizePitchData, noteSequenceToString } from './utils/melodyQuantizer';
 import { matchMelody, getThresholdsForDB } from './utils/matchingEngine';
 import { songDatabase } from './utils/songDatabase';
@@ -14,8 +14,14 @@ import { findPreview } from './utils/previewLookup';
 // Both pools share the same schema; the scorer treats them identically.
 // Spotify-origin tracks carry source: 'spotify' for UI/debug purposes.
 const sampleTracks = [...tracksDatabase, ...spotifyTracks];
+// id → track lookup, so the taste model can resolve a signal's genre/affect
+// without re-scanning the pool.
+const trackById = new Map(sampleTracks.map((t) => [t.id, t]));
 import HowItWorks from './components/HowItWorks';
 import AffectSpaceExplorer from './components/AffectSpaceExplorer';
+import TastePanel from './components/TastePanel';
+import { profileStore, recordEvent as appendEvent, emptyProfile } from './utils/profileStore';
+import { learnTaste, tasteBonus, isFavoredGenre } from './utils/tasteModel';
 
 // ============================================
 // EARCANDY - Music Recognition & Recommendation
@@ -67,6 +73,13 @@ function formatGenreId(id) {
     .split('-')
     .map(w => w[0] ? w[0].toUpperCase() + w.slice(1) : w)
     .join(' ');
+}
+
+// World region for a genre id (used to stamp telemetry events and tell
+// "familiar" from "unfamiliar" in the listener test). Null when unknown.
+function regionOf(genreId) {
+  const g = globalGenres.find(x => x.id === genreId);
+  return g ? g.region : null;
 }
 
 // Find the closest named mood for a given (v, e) point — used to label
@@ -230,9 +243,60 @@ export default function EarCandy() {
   // place and inserts a derived cluster right after it, so we remember which
   // seeds are already expanded to render a filled heart and avoid re-inserting.
   const [likedTrackIds, setLikedTrackIds] = useState(() => new Set());
+  // Stage 4 (live learning): a persisted profile. Loaded once from the swappable
+  // ProfileStore (localStorage today, backend later). A per-song event log
+  // (like / skip / never / play-with-listen-time) accumulates across sessions
+  // and derives a taste vector that biases scoring *within* whatever mood the
+  // user picks — never overriding it. The log is also the substrate the future
+  // listener-test "test mode" reads and exports.
+  const [profile, setProfile] = useState(() => profileStore.load());
+  const taste = useMemo(() => learnTaste(profile.events, trackById), [profile]);
+  // Append one telemetry event and persist. Stable (no deps) so the play-timing
+  // refs can call it without stale closures. `track` supplies genre+region;
+  // `ms` (play only) is how long the clip was actually heard.
+  const logEvent = useCallback((type, track, ms) => {
+    setProfile((prev) => {
+      const next = appendEvent(prev, {
+        type,
+        id: track.id,
+        genre: track.genre,
+        region: regionOf(track.genre),
+        ...(typeof ms === 'number' ? { ms } : {}),
+      });
+      profileStore.save(next);
+      return next;
+    });
+  }, []);
+  // Export downloads the profile as JSON; import restores one; reset forgets all
+  // learning. (Portable now, backend-syncable later — same profile shape.)
+  const exportProfile = useCallback(() => {
+    const blob = new Blob([profileStore.serialize(profile)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'earcandy-taste.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }, [profile]);
+  const importProfile = useCallback((text) => {
+    try {
+      const next = profileStore.deserialize(text);
+      profileStore.save(next);
+      setProfile(next);
+    } catch {
+      alert('Could not import: that file is not a valid EarCandy taste profile.');
+    }
+  }, []);
+  const resetProfile = useCallback(() => {
+    profileStore.clear();
+    setProfile(emptyProfile());
+  }, []);
   // Stage 3d audio preview state. We share ONE <audio> element across all cards
   // so playing a new track auto-stops whatever was playing before.
   const audioRef = useRef(null);
+  // Play-telemetry: the track whose clip is currently being timed, and a ref to
+  // the latest flush fn so the once-bound 'ended' listener never goes stale.
+  const currentPlayRef = useRef(null);
+  const flushRef = useRef(null);
   const [playingTrackId, setPlayingTrackId] = useState(null);
   const [loadingPreviewId, setLoadingPreviewId] = useState(null);
   const [unavailablePreviewIds, setUnavailablePreviewIds] = useState(() => new Set());
@@ -566,7 +630,9 @@ export default function EarCandy() {
     const proximityScore = proximity * 70;
     const labelMatch = namedMatchId && track.mood === namedMatchId ? 15 : 0;
     const variety = Math.random() * 15;
-    const score = proximityScore + labelMatch + variety;
+    // Live-learning bias: ±8 points from the learned per-genre taste. Bounded so
+    // mood proximity (~70) always dominates — taste only settles near-ties.
+    const score = proximityScore + labelMatch + variety + tasteBonus(taste, track);
 
     // Build a human-readable reason — calibrated for the ~1,200-track dense pool.
     // Finer proximity tiers (5 instead of 3) and tighter delta thresholds (0.07
@@ -580,6 +646,7 @@ export default function EarCandy() {
     else reasons.push('related mood');
 
     if (labelMatch) reasons.push(`tagged ${namedMatchId}`);
+    if (isFavoredGenre(taste, track.genre)) reasons.push('your kind of thing');
 
     // Per-axis leans — tighter threshold so subtle leans get described.
     // Magnitude tiers ("nudges" vs "much" vs "noticeably") give richer wording.
@@ -601,7 +668,7 @@ export default function EarCandy() {
     else if (track.valence < 0.4 && track.energy < 0.4) reasons.push('reflective / wistful');
 
     return { ...track, score, distance, proximity, reason: reasons.join(' • ') };
-  }, []);
+  }, [taste]);
 
   // Generate recommendations using affect-space proximity (Russell's circumplex).
   //
@@ -725,7 +792,8 @@ export default function EarCandy() {
       return next;
     });
     setLikedTrackIds(prev => new Set(prev).add(seed.id));
-  }, [skippedTrackIds, scoreTrackAgainstTarget]);
+    logEvent('like', seed); // ❤ → positive signal for live learning
+  }, [skippedTrackIds, scoreTrackAgainstTarget, logEvent]);
 
   // Remove a single track from the playlist in place (a splice, not a regen).
   // `sticky` also adds it to the skip set so it won't reappear in any cluster.
@@ -738,10 +806,23 @@ export default function EarCandy() {
     });
   }, []);
 
-  const lessLikeThis = useCallback((track) => removeTrack(track, { sticky: true }), [removeTrack]);
-  const skipTrack    = useCallback((track) => removeTrack(track, { sticky: false }), [removeTrack]);
+  const lessLikeThis = useCallback((track) => { removeTrack(track, { sticky: true }); logEvent('never', track); }, [removeTrack, logEvent]);
+  const skipTrack    = useCallback((track) => { removeTrack(track, { sticky: false }); logEvent('skip', track); }, [removeTrack, logEvent]);
 
   const clearSkipped = useCallback(() => setSkippedTrackIds(new Set()), []);
+
+  // flushPlay logs the clip just heard (actual seconds from the <audio> element)
+  // and clears the timer. Called at every stop point so listen-time is captured
+  // whether the clip ended, was paused, switched away from, or the tab changed.
+  const flushPlay = useCallback(() => {
+    const cur = currentPlayRef.current;
+    const audio = audioRef.current;
+    currentPlayRef.current = null;
+    if (!cur || !audio) return;
+    const ms = Math.round((audio.currentTime || 0) * 1000);
+    if (ms >= 500) logEvent('play', cur.track, ms); // ignore sub-half-second blips
+  }, [logEvent]);
+  flushRef.current = flushPlay; // keep the once-bound 'ended' listener current
 
   // ─── Audio preview (Stage 3d) ────────────────────────────────────────────
   //
@@ -757,18 +838,23 @@ export default function EarCandy() {
     // need an Audio constructor up front.
     if (!audioRef.current) {
       audioRef.current = new Audio();
-      audioRef.current.addEventListener('ended', () => setPlayingTrackId(null));
+      audioRef.current.addEventListener('ended', () => {
+        if (flushRef.current) flushRef.current(); // clip finished → log full listen
+        setPlayingTrackId(null);
+      });
     }
     const audio = audioRef.current;
 
     // Pause toggle on the active track
     if (playingTrackId === track.id) {
+      flushPlay();
       audio.pause();
       setPlayingTrackId(null);
       return;
     }
 
-    // Stop whatever else is playing
+    // Stop whatever else is playing (logging how much of it was heard)
+    flushPlay();
     audio.pause();
     setPlayingTrackId(null);
 
@@ -787,21 +873,24 @@ export default function EarCandy() {
     try {
       await audio.play();
       setPlayingTrackId(track.id);
+      currentPlayRef.current = { track }; // start timing this clip for telemetry
     } catch {
       // Autoplay blocked or codec issue — treat as unavailable
       setUnavailablePreviewIds(prev => new Set(prev).add(track.id));
     }
-  }, [playingTrackId, unavailablePreviewIds]);
+  }, [playingTrackId, unavailablePreviewIds, flushPlay]);
 
   // Stop preview when leaving the results tab or unmounting, so audio never
   // keeps playing in the background after the user has moved on.
   useEffect(() => {
     if (activeTab !== 'results' && audioRef.current) {
+      flushPlay();
       audioRef.current.pause();
       setPlayingTrackId(null);
     }
-  }, [activeTab]);
+  }, [activeTab, flushPlay]);
   useEffect(() => () => {
+    if (flushRef.current) flushRef.current();
     if (audioRef.current) audioRef.current.pause();
   }, []);
 
@@ -1773,6 +1862,23 @@ export default function EarCandy() {
         {/* Results Tab */}
         {activeTab === 'results' && recommendations.length > 0 && (
           <div style={{ animation: 'slideUp 0.5s ease' }}>
+            {/* Live-learning: what EarCandy has learned from your ❤ / skips */}
+            <TastePanel
+              colors={colors}
+              count={taste.count}
+              centerLabel={taste.center ? nearestNamedMood(taste.center.v, taste.center.e).mood.label : null}
+              topGenres={taste.topGenres.map(({ genre, weight }) => {
+                const g = globalGenres.find(x => x.id === genre);
+                return { name: g ? g.name : formatGenreId(genre), color: g ? g.color : colors.primary, weight };
+              })}
+              avoided={taste.avoided.map(({ genre, weight }) => {
+                const g = globalGenres.find(x => x.id === genre);
+                return { name: g ? g.name : formatGenreId(genre), color: g ? g.color : colors.primary, weight };
+              })}
+              onExport={exportProfile}
+              onImport={importProfile}
+              onReset={resetProfile}
+            />
             <div style={{
               background: colors.cardBg,
               borderRadius: '24px',
